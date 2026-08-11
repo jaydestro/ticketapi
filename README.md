@@ -5,6 +5,10 @@ prompts. The finished system demonstrates keyless Azure authentication, repeatab
 infrastructure, deterministic test data, a .NET REST API, workload generation, and iterative
 Cosmos DB design reviews.
 
+The prompts describe what to build, not how to build it. That deliberate latitude makes the
+repository a before-and-after harness: run the same prompts with and without Cosmos DB design
+guidance, then use LoadGen to measure the difference in request units and latency.
+
 ## Build sequence
 
 Run the numbered prompts in order.
@@ -47,13 +51,16 @@ the provisioned and seeded Cosmos DB data. It adds:
 
 ### 04 - Review through four lenses
 
-[04-four-lens-prompts.md](Docs/prompts/04-four-lens-prompts.md) contains four separate review
-passes. Run them one at a time to examine and improve:
+[04-four-lens-prompts.md](Docs/prompts/04-four-lens-prompts.md) examines the API from four
+angles, then repairs it. Run each prompt on its own and let its fixes finish first:
 
-1. Data-model scalability
-2. Query cost
-3. Indexing-policy cost
-4. Production readiness
+1. Data model and partition key
+2. RU efficiency
+3. Indexing policy
+4. SDK use and maintainability
+
+A final repair prompt applies Cosmos DB best practices to the API code. Capture a LoadGen
+comparison run before and after this pass to quantify the result.
 
 ## Supporting projects
 
@@ -64,13 +71,16 @@ also reports total request units and elapsed time for the bulk operation.
 
 ### LoadGen
 
-`LoadGen` drives concurrent traffic against the completed API, discovers routes through
-OpenAPI, simulates periodic purchase bursts, and reports Cosmos DB request-unit consumption by
-endpoint. Use [Docs/loadgen.md](Docs/loadgen.md) to run it continuously through the included
-PowerShell launcher.
+`LoadGen` drives concurrent traffic against the completed API and discovers its routes through
+OpenAPI. The default comparison profile is read-only and repeats a fixed set of query shapes,
+so two implementations can be measured against each other; the mixed profile adds writes and
+periodic purchase bursts. Both report per-operation request rate, status counts, latency
+percentiles, and Cosmos DB request-unit consumption on a live dashboard. Use
+[Docs/loadgen.md](Docs/loadgen.md) to run it through the included PowerShell launcher.
 
 ## Shared configuration
 
-`appsettings.json.example` defines the required Cosmos DB settings. Prompt 01 creates the
-ignored root `appsettings.json`, and `Directory.Build.targets` shares it with every project.
-No credentials or account keys belong in the repository.
+`appsettings.json.example` defines the required Cosmos DB settings and placeholders for the
+API's authentication authority and audience. Prompt 01 creates the ignored root
+`appsettings.json`, and `Directory.Build.targets` shares it with every project. No
+credentials or account keys belong in the repository.
