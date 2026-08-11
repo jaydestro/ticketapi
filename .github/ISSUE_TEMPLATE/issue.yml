@@ -1,0 +1,100 @@
+name: Issue
+description: Report a bug, ask a question, or suggest an improvement
+title: "[issue]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this. Please do not include account keys, connection strings,
+        access tokens, subscription IDs, or resource endpoints.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type of issue
+      options:
+        - Bug or unexpected behavior
+        - Question
+        - Suggestion or improvement
+        - Documentation problem
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where does this apply?
+      description: Pick the stage or component involved.
+      options:
+        - "01 - Create Cosmos DB and configure Entra ID"
+        - "02 - Seed ticketing data"
+        - "03 - Build the API"
+        - "04 - Four-lens review"
+        - Seeder project
+        - LoadGen project or launcher
+        - Documentation or README
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Describe the problem, question, or suggestion, including any error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+      description: Skip this if you are asking a question or suggesting an improvement.
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order. Skip if this is not a bug.
+      placeholder: |
+        1. Ran prompt 02 as written
+        2. .\scripts\run-loadgen.ps1 -Profile Comparison -Seed 42
+        3. ...
+    validations:
+      required: false
+
+  - type: input
+    id: dotnet-version
+    attributes:
+      label: .NET SDK version
+      description: Output of `dotnet --version`.
+      placeholder: 10.0.302
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and shell
+      placeholder: Windows 11, PowerShell 7.4
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Console output or logs. This is rendered as code, so no backticks are needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: This issue contains no keys, tokens, connection strings, or subscription identifiers.
+          required: true
