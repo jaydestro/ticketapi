@@ -9,20 +9,20 @@ Collect these values:
 - New resource group and globally unique Cosmos DB account names
 - Database name
 - Events and orders container names
-- Optional new user-assigned managed identity name
+- New user-assigned managed identity name
 
 1. Verify the selected Azure account, subscription, location, and identity. Show the planned
    resource names and ask for approval before creating anything.
 
 2. Create reusable subscription-scope Bicep under `infra/` for:
    - A resource group
-   - A user-assigned managed identity when that identity option is selected
+   - A user-assigned managed identity for the hosted application
    - A serverless Azure Cosmos DB for NoSQL account with local/key authentication disabled
    - One SQL database
    - Events and orders containers, each partitioned by `/id`
    - A data-plane `Cosmos DB Built-in Data Contributor` role assignment for the current
      `az login` user at account scope
-   - The same role assignment for the user-assigned identity when that option is selected
+    - The same role assignment for the user-assigned managed identity
 
    Do not configure manual or autoscale throughput. Do not store keys, tokens, or connection
    strings.
@@ -45,7 +45,7 @@ Collect these values:
    Preserve the explanatory fields, leave `ConnectionString` empty, and validate the generated
    JSON. Do not create a project-local settings file.
 
-6. Update the root README with prerequisites, deployment and validation commands, resource
-   names, authentication behavior, and cleanup instructions. Do not place credentials in the
-   README or repository.
+6. Keep the root README focused on the repository goal and what each numbered prompt builds.
+   Do not add subscription details, deployed resource names, IDs, endpoints, run results,
+   deployment commands, or other environment-specific metadata.
 ```
