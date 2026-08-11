@@ -66,7 +66,8 @@ also reports total request units and elapsed time for the bulk operation.
 
 `LoadGen` drives concurrent traffic against the completed API, discovers routes through
 OpenAPI, simulates periodic purchase bursts, and reports Cosmos DB request-unit consumption by
-endpoint.
+endpoint. Use [Docs/loadgen.md](Docs/loadgen.md) to run it continuously through the included
+PowerShell launcher.
 
 ## Shared configuration
 
