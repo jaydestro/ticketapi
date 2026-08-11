@@ -1,8 +1,17 @@
 # Seed the Ticketing Data
 
+## Prerequisites
+
+Complete [01-create-cosmos-entra.md](01-create-cosmos-entra.md) first. This prompt seeds the
+Azure Cosmos DB account that prompt 01 provisions, using the root `appsettings.json` it
+generates. The Cosmos DB emulator will not suffice: it does not report request-unit charges
+the way the service does, and every measurement in this workflow depends on RU usage.
+
 ```text
 Seed the Cosmos DB account configured in the root `appsettings.json` using the existing
-Seeder project and the current Entra identity.
+Seeder project and the current Entra identity. Prompt 01 must already be complete. Target the
+provisioned Azure Cosmos DB account rather than the emulator, because the emulator does not
+report usable request-unit charges.
 
 1. Confirm that Seeder targets the configured events and orders containers with `/id`
    partition keys and uses

@@ -1,7 +1,16 @@
 # Create Cosmos DB and Configure Entra ID
 
+## Prerequisites
+
+An Azure account with permission to create an Azure Cosmos DB for NoSQL account, a resource
+group, and a user-assigned managed identity in the target subscription, and to assign
+data-plane roles on the new account. Sign in with `az login` before running the prompt. This
+prompt provisions live Azure resources; the Cosmos DB emulator is not a substitute.
+
 ```text
 Provision a new Azure Cosmos DB for NoSQL environment and configure this workspace to use it.
+This requires an Azure account with permission to create a Cosmos DB account in the selected
+subscription. Confirm that permission before creating anything and stop if it is missing.
 
 Collect these values:
 
