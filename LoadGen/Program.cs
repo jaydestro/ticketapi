@@ -1,21 +1,33 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using static LoadGenConstants;
 
-// Standalone traffic generator for the ticketing API. It floods the API and reads back the
-// Cosmos DB RU charge header, keeping a live in-place console readout. Nothing is written to
-// disk and no analysis happens beyond the final totals printed on exit.
-// Usage: LoadGen --concurrency <n> [--seed <n>] [--duration <seconds>] [--base-url <url>]
+// Standalone traffic generator for the ticketing API. It reads the Cosmos DB RU charge header
+// and prints recurring per-operation latency, status, and RU comparisons.
+// Usage: LoadGen --concurrency <n> [--profile mixed|comparison] [--report-interval <seconds>]
+//                [--seed <n>] [--duration <seconds>] [--base-url <url>]
 
 var parsed = ParseArgs(args);
 if (parsed is null)
 {
-    Console.Error.WriteLine("Usage: LoadGen --concurrency <n> [--seed <n>] [--duration <seconds>] [--base-url <url>]");
+    Console.Error.WriteLine(
+        "Usage: LoadGen --concurrency <n> [--profile mixed|comparison] " +
+        "[--report-interval <seconds>] [--seed <n>] [--duration <seconds>] [--base-url <url>]");
     return 1;
 }
 
-var (requestedSeed, baseConcurrency, durationSeconds, baseUrl) = parsed.Value;
+var (requestedSeed, baseConcurrency, durationSeconds, baseUrl, profile, reportIntervalSeconds) = parsed;
+var instanceLock = TryAcquireInstanceLock();
+if (instanceLock is null)
+{
+    Console.Error.WriteLine(
+        "loadgen: another LoadGen process is already running on this machine. Stop it before starting another comparison.");
+    return 3;
+}
+using var instanceLockHandle = instanceLock;
 // --seed only controls RNG reproducibility for the traffic shape; random by default so it's not required.
 var seed = requestedSeed ?? Random.Shared.Next();
 var openEnded = durationSeconds is null;
@@ -57,8 +69,20 @@ string[] priceTiers = ["Economy", "Standard", "Premium", "VIP"];
     (RequestKind.CreateEvent, 1)
 ];
 
+// Stable, read-only mix for before/after comparisons. It includes the query shapes previously
+// responsible for the largest RU and latency costs, plus a point-read control.
+(RequestKind Kind, double Weight)[] comparisonWeights =
+[
+    (RequestKind.EventDetail, 10),
+    (RequestKind.UpcomingEvents, 20),
+    (RequestKind.EventsByCity, 20),
+    (RequestKind.OrdersByCustomer, 20),
+    (RequestKind.OrdersByEvent, 30)
+];
+
 var baseWeightTotal = baseWeights.Sum(w => w.Weight);
 var burstWeightTotal = burstWeights.Sum(w => w.Weight);
+var comparisonWeightTotal = comparisonWeights.Sum(w => w.Weight);
 
 using var http = new HttpClient(new SocketsHttpHandler
 {
@@ -69,6 +93,18 @@ using var http = new HttpClient(new SocketsHttpHandler
     BaseAddress = new Uri(baseUrl),
     Timeout = TimeSpan.FromSeconds(30)
 };
+
+var accessToken = Environment.GetEnvironmentVariable("TICKETING_API_ACCESS_TOKEN");
+if (!string.IsNullOrWhiteSpace(accessToken))
+{
+    if (!http.BaseAddress.IsLoopback && http.BaseAddress.Scheme != Uri.UriSchemeHttps)
+    {
+        Console.Error.WriteLine("loadgen: bearer tokens require HTTPS for non-loopback targets.");
+        return 1;
+    }
+
+    http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+}
 
 // Literal paths this generator was written against; used whenever OpenAPI discovery can't confirm otherwise.
 Dictionary<RequestKind, string> defaultRoutes = new()
@@ -83,17 +119,14 @@ Dictionary<RequestKind, string> defaultRoutes = new()
 };
 
 var routes = new Dictionary<RequestKind, string>(defaultRoutes);
-await DiscoverRoutesAsync(http, routes);
+if (!await DiscoverRoutesAsync(http, routes, profile))
+{
+    return 2;
+}
 
 var rng = new Random(seed);
 var stopwatch = Stopwatch.StartNew();
-
-var totalSent = 0L;
-var completedWithCharge = 0L;
-var totalRuCharge = 0.0;
-var ruLock = new object();
-var kindCounts = new long[Enum.GetValues<RequestKind>().Length];
-var kindRuCharges = new double[Enum.GetValues<RequestKind>().Length];
+var metrics = new MetricsCollector();
 
 // Ctrl+C should stop launching new requests and drain in-flight ones, not kill the process outright.
 using var stopRequested = new CancellationTokenSource();
@@ -104,11 +137,20 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 var inFlight = new List<Task>();
-var lastPrintElapsed = TimeSpan.Zero;
-var lastPrintSent = 0L;
-var lastPrintRu = 0.0;
+var lastReportElapsed = TimeSpan.Zero;
+var previousSnapshot = metrics.Snapshot();
+var dashboard = new LiveDashboard();
+AppDomain.CurrentDomain.ProcessExit += (_, _) => dashboard.Complete();
 
-Console.WriteLine($"loadgen: seed={seed} concurrency={baseConcurrency} duration={(openEnded ? "until Ctrl+C" : $"{durationSeconds}s")} target={baseUrl}");
+Console.WriteLine(
+    $"loadgen: profile={profile} seed={seed} concurrency={baseConcurrency} " +
+    $"duration={(openEnded ? "until Ctrl+C" : $"{durationSeconds}s")} target={baseUrl}");
+if (profile == LoadProfiles.Comparison)
+{
+    Console.WriteLine(
+        "loadgen: comparison profile is read-only and targets point read, upcoming, city, " +
+        "customer-order, and hot-event-order queries");
+}
 
 while (!stopRequested.IsCancellationRequested && (openEnded || stopwatch.Elapsed < duration))
 {
@@ -116,76 +158,77 @@ while (!stopRequested.IsCancellationRequested && (openEnded || stopwatch.Elapsed
 
     var elapsed = stopwatch.Elapsed;
     var cyclePosition = elapsed.TotalSeconds % BurstPeriodSeconds;
-    var inBurst = cyclePosition < BurstDurationSeconds;
+    var inBurst = profile == LoadProfiles.Mixed && cyclePosition < BurstDurationSeconds;
     var targetConcurrency = inBurst ? baseConcurrency * BurstMultiplier : baseConcurrency;
 
     while (inFlight.Count < targetConcurrency && !stopRequested.IsCancellationRequested &&
            (openEnded || stopwatch.Elapsed < duration))
     {
-        var (kind, method, path, body) = NextRequest(rng, inBurst);
+        var (kind, method, path, body) = NextRequest(rng, inBurst, profile);
         inFlight.Add(SendAsync(http, kind, method, path, body));
-        Interlocked.Increment(ref totalSent);
+        metrics.RecordSent(kind);
     }
 
-    if ((elapsed - lastPrintElapsed).TotalSeconds >= 0.2)
+    if ((elapsed - lastReportElapsed).TotalSeconds >= reportIntervalSeconds)
     {
-        var sent = Interlocked.Read(ref totalSent);
-        double ru;
-        lock (ruLock) { ru = totalRuCharge; }
-
-        var intervalSeconds = (elapsed - lastPrintElapsed).TotalSeconds;
-        var rate = (sent - lastPrintSent) / intervalSeconds;
-        var ruPerSec = (ru - lastPrintRu) / intervalSeconds;
-
-        // \r overwrites the same line so this stays readable instead of scrolling.
-        Console.Write($"\rsent={sent}  rate={rate,7:F1}/s  RU/s={ruPerSec,8:F1}  totalRU={ru,10:F1}   ");
-        lastPrintElapsed = elapsed;
-        lastPrintSent = sent;
-        lastPrintRu = ru;
+        var currentSnapshot = metrics.Snapshot();
+        PrintIntervalReport(
+            dashboard,
+            profile,
+            inBurst,
+            targetConcurrency,
+            elapsed,
+            elapsed - lastReportElapsed,
+            previousSnapshot,
+            currentSnapshot);
+        previousSnapshot = currentSnapshot;
+        lastReportElapsed = elapsed;
     }
 
     await Task.Delay(20);
 }
 
-Console.Write($"\rstopping - draining {inFlight.Count} in-flight request(s)...                                   \n");
+dashboard.Complete();
+Console.WriteLine($"loadgen: stopping - draining {inFlight.Count} in-flight request(s)...");
 await Task.WhenAll(inFlight);
 
-var finalSent = Interlocked.Read(ref totalSent);
-double finalRu;
-lock (ruLock) { finalRu = totalRuCharge; }
-var finalCompleted = Interlocked.Read(ref completedWithCharge);
-var avgRu = finalCompleted > 0 ? finalRu / finalCompleted : 0.0;
-
-Console.WriteLine($"loadgen: total requests={finalSent}  total RU={finalRu:F1}  avg RU/request={avgRu:F2}");
-Console.WriteLine("RU by endpoint:");
-lock (ruLock)
+var finalSnapshot = metrics.Snapshot();
+PrintFinalReport(profile, stopwatch.Elapsed, finalSnapshot);
+if (finalSnapshot.Total.Success == 0)
 {
-    foreach (var kind in Enum.GetValues<RequestKind>())
-    {
-        var count = kindCounts[(int)kind];
-        var ru = kindRuCharges[(int)kind];
-        var avg = count > 0 ? ru / count : 0.0;
-        Console.WriteLine($"  {kind,-16} requests={count,-7} totalRU={ru,10:F1}  avgRU={avg,6:F2}");
-    }
+    Console.Error.WriteLine("loadgen: no requests succeeded; check the API routes, data, and access token.");
+    return 4;
 }
+
 return 0;
 
-(RequestKind Kind, HttpMethod Method, string Path, string? Body) NextRequest(Random r, bool burst)
+(RequestKind Kind, HttpMethod Method, string Path, string? Body) NextRequest(
+    Random r,
+    bool burst,
+    string selectedProfile)
 {
-    var weights = burst ? burstWeights : baseWeights;
-    var total = burst ? burstWeightTotal : baseWeightTotal;
+    var weights = selectedProfile == LoadProfiles.Comparison
+        ? comparisonWeights
+        : burst ? burstWeights : baseWeights;
+    var total = selectedProfile == LoadProfiles.Comparison
+        ? comparisonWeightTotal
+        : burst ? burstWeightTotal : baseWeightTotal;
     var kind = PickKind(r, weights, total);
 
     var (method, path, body) = kind switch
     {
         RequestKind.EventDetail =>
-            (HttpMethod.Get, BuildPath(routes[kind], PickEventId(r)), (string?)null),
+            (HttpMethod.Get, BuildPath(
+                routes[kind],
+                selectedProfile == LoadProfiles.Comparison ? ChampionshipEventId : PickEventId(r)), (string?)null),
 
         RequestKind.UpcomingEvents =>
             (HttpMethod.Get, routes[kind], null),
 
         RequestKind.EventsByCity =>
-            (HttpMethod.Get, BuildPath(routes[kind], cities[r.Next(cities.Length)]), null),
+            (HttpMethod.Get, BuildPath(
+                routes[kind],
+                selectedProfile == LoadProfiles.Comparison ? ComparisonCity : cities[r.Next(cities.Length)]), null),
 
         RequestKind.PurchaseTicket =>
             (HttpMethod.Post, routes[kind], JsonSerializer.Serialize(new
@@ -196,10 +239,14 @@ return 0;
             })),
 
         RequestKind.OrdersByCustomer =>
-            (HttpMethod.Get, BuildPath(routes[kind], PickCustomerId(r)), null),
+            (HttpMethod.Get, BuildPath(
+                routes[kind],
+                selectedProfile == LoadProfiles.Comparison ? ComparisonCustomerId : PickCustomerId(r)), null),
 
         RequestKind.OrdersByEvent =>
-            (HttpMethod.Get, BuildPath(routes[kind], PickEventId(r)), null),
+            (HttpMethod.Get, BuildPath(
+                routes[kind],
+                selectedProfile == LoadProfiles.Comparison ? ChampionshipEventId : PickEventId(r)), null),
 
         RequestKind.CreateEvent =>
             (HttpMethod.Post, routes[kind], JsonSerializer.Serialize(new
@@ -226,9 +273,11 @@ string BuildPath(string template, string value)
     return string.Join('/', segments);
 }
 
-// Best-effort: reads the API's own OpenAPI doc and reconciles our known routes against it, so a
-// renamed/moved endpoint is picked up automatically instead of silently 404ing all night on stream.
-async Task DiscoverRoutesAsync(HttpClient client, Dictionary<RequestKind, string> targetRoutes)
+// Reads the API's OpenAPI document and requires every route used by the selected profile.
+async Task<bool> DiscoverRoutesAsync(
+    HttpClient client,
+    Dictionary<RequestKind, string> targetRoutes,
+    string selectedProfile)
 {
     try
     {
@@ -236,8 +285,19 @@ async Task DiscoverRoutesAsync(HttpClient client, Dictionary<RequestKind, string
         using var response = await client.GetAsync("/openapi/v1.json", cts.Token);
         if (!response.IsSuccessStatusCode)
         {
-            Console.WriteLine("loadgen: OpenAPI doc unavailable, using built-in default routes");
-            return;
+            if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized
+                or System.Net.HttpStatusCode.Forbidden)
+            {
+                Console.WriteLine(
+                    $"loadgen: OpenAPI discovery returned {(int)response.StatusCode} " +
+                    $"({response.StatusCode}); set TICKETING_API_ACCESS_TOKEN to a token with " +
+                    "Ticketing.Read access. Stopping");
+                return false;
+            }
+            Console.WriteLine(
+                $"loadgen: OpenAPI discovery returned {(int)response.StatusCode} " +
+                $"({response.StatusCode}). Stopping");
+            return false;
         }
 
         using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
@@ -245,8 +305,8 @@ async Task DiscoverRoutesAsync(HttpClient client, Dictionary<RequestKind, string
 
         if (!doc.RootElement.TryGetProperty("paths", out var paths))
         {
-            Console.WriteLine("loadgen: OpenAPI doc had no paths, using built-in default routes");
-            return;
+            Console.WriteLine("loadgen: OpenAPI document has no paths. Stopping");
+            return false;
         }
 
         var discovered = new Dictionary<RequestKind, string>();
@@ -264,6 +324,25 @@ async Task DiscoverRoutesAsync(HttpClient client, Dictionary<RequestKind, string
         }
 
         var mismatches = new List<string>();
+        RequestKind[] requiredKinds = selectedProfile == LoadProfiles.Comparison
+            ?
+            [
+                RequestKind.EventDetail,
+                RequestKind.UpcomingEvents,
+                RequestKind.EventsByCity,
+                RequestKind.OrdersByCustomer,
+                RequestKind.OrdersByEvent
+            ]
+            : Enum.GetValues<RequestKind>();
+        var missingKinds = requiredKinds.Where(kind => !discovered.ContainsKey(kind)).ToArray();
+        if (missingKinds.Length > 0)
+        {
+            Console.WriteLine(
+                $"loadgen: OpenAPI is missing required {selectedProfile} route(s): " +
+                string.Join(", ", missingKinds.Select(GetDisplayName)) + ". Stopping");
+            return false;
+        }
+
         foreach (var (kind, path) in discovered)
         {
             // ASP.NET Core routing is case-insensitive, so only flag genuine route changes, not casing.
@@ -282,11 +361,13 @@ async Task DiscoverRoutesAsync(HttpClient client, Dictionary<RequestKind, string
         {
             Console.WriteLine($"  {m}");
         }
+
+        return true;
     }
     catch (Exception ex)
     {
-        // Discovery is a nicety, not a requirement - never let it block the run.
-        Console.WriteLine($"loadgen: OpenAPI discovery failed ({ex.GetType().Name}), using built-in default routes");
+        Console.WriteLine($"loadgen: OpenAPI discovery failed ({ex.GetType().Name}). Stopping");
+        return false;
     }
 }
 
@@ -337,9 +418,15 @@ string PickCustomerId(Random r) => $"customer-{r.Next(1, CustomerCount + 1):D5}"
 
 async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, string path, string? jsonBody)
 {
+    var requestStopwatch = Stopwatch.StartNew();
     try
     {
         using var request = new HttpRequestMessage(method, path);
+        if (kind == RequestKind.PurchaseTicket)
+        {
+            request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString("N"));
+        }
+
         if (jsonBody is not null)
         {
             request.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
@@ -347,32 +434,142 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
 
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
+        double? charge = null;
         if (response.Headers.TryGetValues("x-ms-request-charge", out var values) &&
-            double.TryParse(values.FirstOrDefault(), out var charge))
+            double.TryParse(
+                values.FirstOrDefault(),
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var parsedCharge))
         {
-            lock (ruLock)
-            {
-                totalRuCharge += charge;
-                kindRuCharges[(int)kind] += charge;
-                kindCounts[(int)kind]++;
-            }
-            Interlocked.Increment(ref completedWithCharge);
+            charge = parsedCharge;
         }
 
         await response.Content.CopyToAsync(Stream.Null);
+        requestStopwatch.Stop();
+        metrics.RecordCompleted(kind, (int)response.StatusCode, charge, requestStopwatch.Elapsed);
     }
-    catch
+    catch (Exception)
     {
-        // This is a traffic generator, not a test harness - failed/timed-out requests are dropped silently.
+        requestStopwatch.Stop();
+        metrics.RecordNetworkFailure(kind, requestStopwatch.Elapsed);
     }
 }
 
-(int? Seed, int Concurrency, double? DurationSeconds, string BaseUrl)? ParseArgs(string[] a)
+void PrintIntervalReport(
+    LiveDashboard liveDashboard,
+    string selectedProfile,
+    bool inBurst,
+    int targetConcurrency,
+    TimeSpan elapsed,
+    TimeSpan interval,
+    MetricsSnapshot previous,
+    MetricsSnapshot current)
+{
+    var lines = new List<string>
+    {
+        $"[{DateTimeOffset.Now:HH:mm:ss}] profile={selectedProfile} " +
+        $"mode={(inBurst ? "burst" : "steady")} concurrency={targetConcurrency} " +
+        $"elapsed={elapsed:hh\\:mm\\:ss}",
+        $"{"operation",-22} {"req/s",7} {"2xx",7} {"4xx",6} {"5xx",6} {"net",5} " +
+        $"{"avg ms",8} {"p95 ms",8} {"avg RU",8} {"RU/s",9} {"total RU",11}"
+    };
+
+    foreach (var kind in Enum.GetValues<RequestKind>())
+    {
+        var delta = current[kind] - previous[kind];
+        var seconds = Math.Max(interval.TotalSeconds, 0.001);
+        var avgMilliseconds = delta.Completed > 0
+            ? delta.TotalMilliseconds / delta.Completed
+            : 0;
+        var avgRu = delta.Charged > 0 ? $"{delta.RequestCharge / delta.Charged:F2}" : "N/A";
+        var ruPerSecond = delta.Charged > 0 ? $"{delta.RequestCharge / seconds:F1}" : "N/A";
+        var totalRu = current[kind].Charged > 0 ? $"{current[kind].RequestCharge:F1}" : "N/A";
+        var p95 = MetricsCollector.GetPercentileMilliseconds(delta.Histogram, 0.95);
+
+        lines.Add(
+            $"{GetDisplayName(kind),-22} {delta.Completed / seconds,7:F1} {delta.Success,7:N0} " +
+            $"{delta.ClientErrors,6:N0} {delta.ServerErrors,6:N0} {delta.NetworkErrors,5:N0} " +
+            $"{avgMilliseconds,8:F0} {p95,8:F0} {avgRu,8} {ruPerSecond,9} {totalRu,11}");
+    }
+
+    liveDashboard.Render(lines);
+}
+
+void PrintFinalReport(string selectedProfile, TimeSpan elapsed, MetricsSnapshot snapshot)
+{
+    Console.WriteLine();
+    Console.WriteLine($"=== LoadGen final comparison: {selectedProfile} ({elapsed:hh\\:mm\\:ss}) ===");
+    Console.WriteLine(
+        $"{"operation",-22} {"sent",9} {"done",9} {"2xx",9} {"4xx",7} {"5xx",7} {"net",7} " +
+        $"{"avg ms",9} {"p95 ms",9} {"avg RU",9} {"total RU",12}");
+
+    foreach (var kind in Enum.GetValues<RequestKind>())
+    {
+        var value = snapshot[kind];
+        var avgMilliseconds = value.Completed > 0
+            ? value.TotalMilliseconds / value.Completed
+            : 0;
+        var avgRu = value.Charged > 0 ? $"{value.RequestCharge / value.Charged:F2}" : "N/A";
+        var totalRu = value.Charged > 0 ? $"{value.RequestCharge:F1}" : "N/A";
+        var p95 = MetricsCollector.GetPercentileMilliseconds(value.Histogram, 0.95);
+        Console.WriteLine(
+            $"{GetDisplayName(kind),-22} {value.Sent,9:N0} {value.Completed,9:N0} " +
+            $"{value.Success,9:N0} {value.ClientErrors,7:N0} {value.ServerErrors,7:N0} " +
+            $"{value.NetworkErrors,7:N0} {avgMilliseconds,9:F0} {p95,9:F0} " +
+                $"{avgRu,9} {totalRu,12}");
+    }
+
+    var totals = snapshot.Total;
+            var totalAverageRu = totals.Charged > 0 ? $"{totals.RequestCharge / totals.Charged:F2}" : "N/A";
+            var totalRequestCharge = totals.Charged > 0 ? $"{totals.RequestCharge:F1}" : "N/A";
+    Console.WriteLine(
+        $"TOTAL                  {totals.Sent,9:N0} {totals.Completed,9:N0} " +
+        $"{totals.Success,9:N0} {totals.ClientErrors,7:N0} {totals.ServerErrors,7:N0} " +
+        $"{totals.NetworkErrors,7:N0} {totals.AverageMilliseconds,9:F0} " +
+        $"{MetricsCollector.GetPercentileMilliseconds(totals.Histogram, 0.95),9:F0} " +
+        $"{totalAverageRu,9} {totalRequestCharge,12}");
+}
+
+string GetDisplayName(RequestKind kind) => kind switch
+{
+    RequestKind.EventDetail => "event point read",
+    RequestKind.UpcomingEvents => "upcoming query",
+    RequestKind.EventsByCity => "city query",
+    RequestKind.PurchaseTicket => "purchase write",
+    RequestKind.OrdersByCustomer => "customer orders",
+    RequestKind.OrdersByEvent => "hot-event orders",
+    RequestKind.CreateEvent => "create event",
+    _ => kind.ToString()
+};
+
+FileStream? TryAcquireInstanceLock()
+{
+    try
+    {
+        var lockPath = Path.Combine(Path.GetTempPath(), "ticketapi-loadgen.lock");
+        return new FileStream(
+            lockPath,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            bufferSize: 1,
+            FileOptions.DeleteOnClose);
+    }
+    catch (IOException)
+    {
+        return null;
+    }
+}
+
+LoadGenOptions? ParseArgs(string[] a)
 {
     int? seed = null;
     int? concurrency = null;
     double? parsedDuration = null;
     var url = "http://localhost:5107";
+    var selectedProfile = LoadProfiles.Mixed;
+    var reportInterval = 2.0;
 
     for (var i = 0; i < a.Length; i++)
     {
@@ -386,7 +583,12 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
                 concurrency = c;
                 i++;
                 break;
-            case "--duration" when i + 1 < a.Length && double.TryParse(a[i + 1], out var dur):
+            case "--duration" when i + 1 < a.Length &&
+                double.TryParse(
+                    a[i + 1],
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out var dur):
                 parsedDuration = dur;
                 i++;
                 break;
@@ -394,12 +596,39 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
                 url = a[i + 1];
                 i++;
                 break;
+            case "--profile" when i + 1 < a.Length &&
+                a[i + 1] is LoadProfiles.Mixed or LoadProfiles.Comparison:
+                selectedProfile = a[i + 1];
+                i++;
+                break;
+            case "--report-interval" when i + 1 < a.Length &&
+                double.TryParse(
+                    a[i + 1],
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out var interval) && interval is >= 0.5 and <= 60:
+                reportInterval = interval;
+                i++;
+                break;
             default:
                 return null;
         }
     }
 
-    return concurrency is null ? null : (seed, concurrency.Value, parsedDuration, url);
+    return concurrency is null or < 1 or > 4_000 ||
+        parsedDuration is <= 0 ||
+        (parsedDuration is { } duration && !double.IsFinite(duration)) ||
+        parsedDuration > TimeSpan.MaxValue.TotalSeconds ||
+        !Uri.TryCreate(url, UriKind.Absolute, out var baseUri) ||
+        (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps)
+        ? null
+        : new LoadGenOptions(
+            seed,
+            concurrency.Value,
+            parsedDuration,
+            url,
+            selectedProfile,
+            reportInterval);
 }
 
 internal enum RequestKind
@@ -413,6 +642,20 @@ internal enum RequestKind
     CreateEvent
 }
 
+internal sealed record LoadGenOptions(
+    int? Seed,
+    int Concurrency,
+    double? DurationSeconds,
+    string BaseUrl,
+    string Profile,
+    double ReportIntervalSeconds);
+
+internal static class LoadProfiles
+{
+    public const string Mixed = "mixed";
+    public const string Comparison = "comparison";
+}
+
 internal static class LoadGenConstants
 {
     public const string ChampionshipEventId = "event-00001";
@@ -422,4 +665,286 @@ internal static class LoadGenConstants
     public const int BurstPeriodSeconds = 30;
     public const int BurstDurationSeconds = 5;
     public const int BurstMultiplier = 10;
+    public const string ComparisonCity = "Memphis";
+    public const string ComparisonCustomerId = "customer-00001";
+}
+
+internal sealed class MetricsCollector
+{
+    private static readonly double[] LatencyUpperBounds =
+        [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, double.MaxValue];
+
+    private readonly OperationMetrics[] _metrics =
+        Enum.GetValues<RequestKind>().Select(_ => new OperationMetrics(LatencyUpperBounds.Length)).ToArray();
+
+    public void RecordSent(RequestKind kind) => _metrics[(int)kind].RecordSent();
+
+    public void RecordCompleted(
+        RequestKind kind,
+        int statusCode,
+        double? requestCharge,
+        TimeSpan elapsed) =>
+        _metrics[(int)kind].RecordCompleted(statusCode, requestCharge, elapsed, LatencyUpperBounds);
+
+    public void RecordNetworkFailure(RequestKind kind, TimeSpan elapsed) =>
+        _metrics[(int)kind].RecordNetworkFailure(elapsed, LatencyUpperBounds);
+
+    public MetricsSnapshot Snapshot() => new(_metrics.Select(metric => metric.Snapshot()).ToArray());
+
+    public static double GetPercentileMilliseconds(IReadOnlyList<long> histogram, double percentile)
+    {
+        var count = histogram.Sum();
+        if (count == 0)
+        {
+            return 0;
+        }
+
+        var target = (long)Math.Ceiling(count * percentile);
+        var cumulative = 0L;
+        for (var index = 0; index < histogram.Count; index++)
+        {
+            cumulative += histogram[index];
+            if (cumulative >= target)
+            {
+                return LatencyUpperBounds[index];
+            }
+        }
+
+        return LatencyUpperBounds[^1];
+    }
+}
+
+internal sealed class OperationMetrics(int histogramSize)
+{
+    private readonly object _sync = new();
+    private readonly long[] _histogram = new long[histogramSize];
+    private long _sent;
+    private long _completed;
+    private long _success;
+    private long _clientErrors;
+    private long _serverErrors;
+    private long _networkErrors;
+    private long _charged;
+    private double _requestCharge;
+    private double _totalMilliseconds;
+
+    public void RecordSent()
+    {
+        lock (_sync)
+        {
+            _sent++;
+        }
+    }
+
+    public void RecordCompleted(
+        int statusCode,
+        double? requestCharge,
+        TimeSpan elapsed,
+        IReadOnlyList<double> latencyUpperBounds)
+    {
+        lock (_sync)
+        {
+            _completed++;
+            if (statusCode is >= 200 and < 300)
+            {
+                _success++;
+            }
+            else if (statusCode < 500)
+            {
+                _clientErrors++;
+            }
+            else
+            {
+                _serverErrors++;
+            }
+
+            if (requestCharge is { } charge)
+            {
+                _charged++;
+                _requestCharge += charge;
+            }
+
+            RecordLatency(elapsed, latencyUpperBounds);
+        }
+    }
+
+    public void RecordNetworkFailure(TimeSpan elapsed, IReadOnlyList<double> latencyUpperBounds)
+    {
+        lock (_sync)
+        {
+            _completed++;
+            _networkErrors++;
+            RecordLatency(elapsed, latencyUpperBounds);
+        }
+    }
+
+    public OperationMetricsSnapshot Snapshot()
+    {
+        lock (_sync)
+        {
+            return new OperationMetricsSnapshot(
+                _sent,
+                _completed,
+                _success,
+                _clientErrors,
+                _serverErrors,
+                _networkErrors,
+                _charged,
+                _requestCharge,
+                _totalMilliseconds,
+                [.. _histogram]);
+        }
+    }
+
+    private void RecordLatency(TimeSpan elapsed, IReadOnlyList<double> latencyUpperBounds)
+    {
+        var milliseconds = elapsed.TotalMilliseconds;
+        _totalMilliseconds += milliseconds;
+        var bucket = 0;
+        while (bucket < latencyUpperBounds.Count - 1 && milliseconds > latencyUpperBounds[bucket])
+        {
+            bucket++;
+        }
+        _histogram[bucket]++;
+    }
+}
+
+internal sealed record OperationMetricsSnapshot(
+    long Sent,
+    long Completed,
+    long Success,
+    long ClientErrors,
+    long ServerErrors,
+    long NetworkErrors,
+    long Charged,
+    double RequestCharge,
+    double TotalMilliseconds,
+    long[] Histogram)
+{
+    public static OperationMetricsSnapshot operator -(
+        OperationMetricsSnapshot current,
+        OperationMetricsSnapshot previous) => new(
+            current.Sent - previous.Sent,
+            current.Completed - previous.Completed,
+            current.Success - previous.Success,
+            current.ClientErrors - previous.ClientErrors,
+            current.ServerErrors - previous.ServerErrors,
+            current.NetworkErrors - previous.NetworkErrors,
+            current.Charged - previous.Charged,
+            current.RequestCharge - previous.RequestCharge,
+            current.TotalMilliseconds - previous.TotalMilliseconds,
+            current.Histogram.Zip(previous.Histogram, (left, right) => left - right).ToArray());
+}
+
+internal sealed record MetricsSnapshot(OperationMetricsSnapshot[] Operations)
+{
+    public OperationMetricsSnapshot this[RequestKind kind] => Operations[(int)kind];
+
+    public MetricsTotal Total => new(
+        Operations.Sum(value => value.Sent),
+        Operations.Sum(value => value.Completed),
+        Operations.Sum(value => value.Success),
+        Operations.Sum(value => value.ClientErrors),
+        Operations.Sum(value => value.ServerErrors),
+        Operations.Sum(value => value.NetworkErrors),
+        Operations.Sum(value => value.Charged),
+        Operations.Sum(value => value.RequestCharge),
+        Operations.Sum(value => value.TotalMilliseconds),
+        Enumerable.Range(0, Operations[0].Histogram.Length)
+            .Select(index => Operations.Sum(value => value.Histogram[index]))
+            .ToArray());
+}
+
+internal sealed record MetricsTotal(
+    long Sent,
+    long Completed,
+    long Success,
+    long ClientErrors,
+    long ServerErrors,
+    long NetworkErrors,
+    long Charged,
+    double RequestCharge,
+    double TotalMilliseconds,
+    long[] Histogram)
+{
+    public double AverageMilliseconds => Completed > 0 ? TotalMilliseconds / Completed : 0;
+    public double AverageRu => Charged > 0 ? RequestCharge / Charged : 0;
+}
+
+internal sealed class LiveDashboard
+{
+    private bool _interactive = !Console.IsOutputRedirected;
+    private bool _started;
+    private bool _completed;
+
+    public void Render(IReadOnlyList<string> lines)
+    {
+        if (!_interactive)
+        {
+            foreach (var line in lines)
+            {
+                Console.WriteLine(line);
+            }
+            return;
+        }
+
+        try
+        {
+            if (!_started)
+            {
+                // Use the terminal's alternate screen buffer, like top/htop. The user's normal
+                // scrollback is restored when Complete is called.
+                Console.Write("\u001b[?1049h\u001b[2J\u001b[H\u001b[?25l");
+                _started = true;
+            }
+
+            Console.Write("\u001b[H");
+            foreach (var line in lines)
+            {
+                Console.Write("\u001b[2K");
+                Console.WriteLine(line);
+            }
+            Console.Write("\u001b[J");
+            Console.Out.Flush();
+        }
+        catch (IOException)
+        {
+            _interactive = false;
+            RestoreTerminal();
+            Console.WriteLine();
+            foreach (var line in lines)
+            {
+                Console.WriteLine(line);
+            }
+        }
+    }
+
+    public void Complete()
+    {
+        if (_completed)
+        {
+            return;
+        }
+
+        _completed = true;
+        RestoreTerminal();
+    }
+
+    private void RestoreTerminal()
+    {
+        if (!_started)
+        {
+            return;
+        }
+        try
+        {
+            Console.Write("\u001b[?25h\u001b[?1049l");
+            Console.Out.Flush();
+            _started = false;
+        }
+        catch (IOException)
+        {
+            _started = false;
+        }
+    }
 }

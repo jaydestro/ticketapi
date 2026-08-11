@@ -1,11 +1,8 @@
 # Build the Ticketing API
 
 ```text
-Create a new .NET 10 ASP.NET Core Web API project for a live event ticketing platform. Keep
-it independent from Seeder and LoadGen. The Cosmos DB resources already exist and contain
-seeded data. Use `Microsoft.Azure.Cosmos`, `DefaultAzureCredential`, and the shared root
-`appsettings.json`; do not create project-local settings or reconfigure Azure resources.
-Enable OpenAPI so LoadGen can discover the routes.
+Create a new .NET 10 ASP.NET Core Web API project for a live event ticketing platform. Keep it independent from Seeder and LoadGen. The Cosmos DB resources already exist and contain seeded data. Use `Microsoft.Azure.Cosmos`, `DefaultAzureCredential`, and the shared root `appsettings.json`; do not create project-local settings or reconfigure Azure resources.
+Enable OpenAPI so LoadGen can discover the routes. Have the app run on port 5107.
 
 The app tracks events, ticket inventory, and customer orders. Implement:
 

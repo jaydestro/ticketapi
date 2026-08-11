@@ -38,6 +38,7 @@ Collect these values:
 5. Create the repository-root `appsettings.json` from `appsettings.json.example`. Keep the
    example file unchanged, then set these values in the generated file:
    - `AccountEndpoint`
+   - `ManagedIdentityClientId`
    - `DatabaseName`
    - `EventsContainerName`
    - `OrdersContainerName`

@@ -3,3 +3,6 @@ obj/
 appsettings.json
 .azure/
 infra/
+.agents/
+.claude/
+skills-lock.json
