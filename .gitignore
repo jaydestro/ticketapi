@@ -6,3 +6,5 @@ infra/
 .agents/
 .claude/
 skills-lock.json
+examples/*/appsettings.json
+TestResults/

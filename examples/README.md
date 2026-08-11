@@ -43,11 +43,16 @@ account, and the same seeded data.
 ## Comparing the two
 
 Run LoadGen against each build with identical parameters so the request-unit and latency numbers
-are comparable:
+are comparable. Start one API at a time, then identify its captured project directory to the
+launcher:
 
 ```powershell
-.\scripts\run-loadgen.ps1 -Profile Comparison -Concurrency 10 -Seed 42 -ReportInterval 2
+.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\before\TicketingApi -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2 -Duration 60
+.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\after\TicketingApi -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2 -Duration 60
 ```
+
+The live dashboard and final report include `run=before` or `run=after`, so saved output remains
+attributable when the two runs are compared.
 
 The comparison profile is read-only, so measuring does not modify seeded data.
 

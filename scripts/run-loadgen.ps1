@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 4000)]
-    [int]$Concurrency = 10,
+    [int]$Concurrency = 50,
 
     [int]$Seed,
 
@@ -10,7 +10,17 @@ param(
     [string]$AccessToken = $env:TICKETING_API_ACCESS_TOKEN,
 
     [ValidateSet('Comparison', 'Mixed')]
-    [string]$Profile = 'Comparison',
+    [string]$Workload = 'Comparison',
+
+    [string]$ApiDirectory = 'TicketingApi',
+
+    [string]$RunLabel,
+
+    [ValidateRange(0.1, 86400)]
+    [double]$Duration,
+
+    [ValidateRange(1, 600)]
+    [double]$RequestTimeout = 120,
 
     [ValidateRange(0.5, 60)]
     [double]$ReportInterval = 2
@@ -20,9 +30,30 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $projectPath = Join-Path $repositoryRoot 'LoadGen\LoadGen.csproj'
-$apiProjectPath = Join-Path $repositoryRoot 'TicketingApi\TicketingApi.csproj'
+$apiDirectoryPath = if ([System.IO.Path]::IsPathRooted($ApiDirectory)) {
+    $ApiDirectory
+}
+else {
+    Join-Path $repositoryRoot $ApiDirectory
+}
+$apiDirectoryPath = [System.IO.Path]::GetFullPath($apiDirectoryPath)
+$apiProjectPath = Join-Path $apiDirectoryPath 'TicketingApi.csproj'
+$appSettingsPath = Join-Path $repositoryRoot 'appsettings.json'
 $targetUrl = $BaseUrl.AbsoluteUri.TrimEnd('/')
 $openApiUrl = "$targetUrl/openapi/v1.json"
+
+if ([string]::IsNullOrWhiteSpace($RunLabel)) {
+    $rootApiDirectory = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'TicketingApi'))
+    if ($apiDirectoryPath -eq $rootApiDirectory) {
+        $RunLabel = 'root'
+    }
+    elseif ((Split-Path -Leaf $apiDirectoryPath) -eq 'TicketingApi') {
+        $RunLabel = Split-Path -Leaf (Split-Path -Parent $apiDirectoryPath)
+    }
+    else {
+        $RunLabel = Split-Path -Leaf $apiDirectoryPath
+    }
+}
 
 if (-not $BaseUrl.IsLoopback -and $BaseUrl.Scheme -ne 'https') {
     throw 'A non-loopback API URL must use HTTPS.'
@@ -30,8 +61,12 @@ if (-not $BaseUrl.IsLoopback -and $BaseUrl.Scheme -ne 'https') {
 
 if ([string]::IsNullOrWhiteSpace($AccessToken)) {
     if ($BaseUrl.IsLoopback) {
+        if (-not (Test-Path -LiteralPath $apiProjectPath -PathType Leaf)) {
+            throw "The API project does not exist at '$apiProjectPath'. Set -ApiDirectory to the directory containing TicketingApi.csproj."
+        }
+
         $scopes = @('Ticketing.Read')
-        if ($Profile -eq 'Mixed') {
+        if ($Workload -eq 'Mixed') {
             $scopes += 'Ticketing.Write'
         }
 
@@ -42,7 +77,9 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
             '--project'
             $apiProjectPath
             '--appsettings-file'
-            '..\appsettings.json'
+            $appSettingsPath
+            '--audience'
+            $targetUrl
         )
         foreach ($scope in $scopes) {
             $jwtArguments += @('--scope', $scope)
@@ -94,17 +131,28 @@ $loadGenArguments = @(
     '--base-url'
     $targetUrl
     '--profile'
-    $Profile.ToLowerInvariant()
+    $Workload.ToLowerInvariant()
     '--report-interval'
     $ReportInterval
+    '--request-timeout'
+    $RequestTimeout
+    '--run-label'
+    $RunLabel
 )
 
 if ($PSBoundParameters.ContainsKey('Seed')) {
     $loadGenArguments += @('--seed', $Seed)
 }
 
-Write-Host "Starting unlimited $Profile LoadGen against $targetUrl with base concurrency $Concurrency."
-Write-Host 'Press Ctrl+C to stop and print final request-unit totals.'
+if ($PSBoundParameters.ContainsKey('Duration')) {
+    $loadGenArguments += @('--duration', $Duration)
+}
+
+$durationDescription = if ($PSBoundParameters.ContainsKey('Duration')) { "$Duration seconds" } else { 'until Ctrl+C' }
+Write-Host "Starting run '$RunLabel': $Workload LoadGen against $targetUrl with base concurrency $Concurrency for $durationDescription (request timeout: $RequestTimeout seconds)."
+if (-not $PSBoundParameters.ContainsKey('Duration')) {
+    Write-Host 'Press Ctrl+C to stop and print final request-unit totals.'
+}
 
 $previousToken = $env:TICKETING_API_ACCESS_TOKEN
 try {

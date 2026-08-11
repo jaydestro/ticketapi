@@ -79,7 +79,7 @@ If a change is meant to affect Cosmos DB cost or latency, include a LoadGen comp
 the profile, seed, concurrency, and report interval identical between the two runs:
 
 ```powershell
-.\scripts\run-loadgen.ps1 -Profile Comparison -Concurrency 10 -Seed 42 -ReportInterval 2
+.\scripts\run-loadgen.ps1 -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2
 ```
 
 The default comparison profile is read-only, so it will not modify seeded data.
