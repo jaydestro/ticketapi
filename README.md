@@ -12,10 +12,59 @@ guidance, then use LoadGen to measure the difference in request units and latenc
 ## Tools used
 
 - [Cosmos DB Agent Kit](https://aka.ms/azurecosmosdb-agent-kit) provides tools and guidance
-	for building AI-assisted workflows with Azure Cosmos DB.
+  for building AI-assisted workflows with Azure Cosmos DB.
 - [Azure Cosmos DB Shell](https://github.com/Azure/CosmosDBShell) is a command-line interface
-	for interacting with Azure Cosmos DB through intuitive, Bash-like commands, with optional
-	Model Context Protocol (MCP) server support for AI-powered automation.
+  for interacting with Azure Cosmos DB through intuitive, Bash-like commands, with optional
+  Model Context Protocol (MCP) server support for AI-powered automation.
+
+## Prerequisites
+
+Install and configure these tools before starting prompt 01:
+
+- **Git** to clone the repository and keep the before/after runs on separate branches.
+- **Visual Studio Code** with **GitHub Copilot Chat** and access to an agent-capable Copilot model.
+- The [**Cosmos DB Agent Kit**](https://aka.ms/azurecosmosdb-agent-kit) for the guided review.
+- **.NET SDK 10.0.302 or later**. The API, Seeder, LoadGen, and tests target `net10.0`.
+- **PowerShell 7** (`pwsh`). The included launcher and validation commands use PowerShell.
+- **Azure CLI** with the **Bicep CLI** available through `az bicep`. Sign in interactively with
+  `az login`, select the intended subscription, and verify it before provisioning anything.
+- **A live Azure subscription**. The comparison requires request-unit charges from Azure Cosmos
+  DB; the emulator is not a substitute for this workflow.
+
+The signed-in Azure identity must be able to:
+
+- Create a resource group, user-assigned managed identity, Azure Cosmos DB for NoSQL account,
+  database, and containers in the selected subscription.
+- Run subscription-scope deployments and deployment what-if operations.
+- Create Cosmos DB data-plane role assignments for itself and the managed identity.
+- Read and write items through Microsoft Entra ID after normal RBAC propagation.
+
+`Contributor`-equivalent resource permissions plus permission to create the Cosmos DB data-plane
+role assignments satisfy the workflow. In a restricted subscription, ask an administrator to
+grant the missing capability or perform the role-assignment step. Do not continue with a different
+subscription or identity merely to bypass a permission failure.
+
+The Azure Cosmos DB Shell is optional for the numbered workflow, but useful for inspecting the
+result. Node.js is not required by the .NET projects; install npm dependencies only when using the
+optional root Azure MCP package directly.
+
+### Preflight check
+
+Run these commands from PowerShell before opening prompt 01:
+
+```powershell
+git --version
+dotnet --version
+pwsh --version
+az version
+az bicep version
+az login
+az account show --output table
+```
+
+Confirm that `.NET` reports `10.0.302` or later, `pwsh` is version 7 or later, and
+`az account show` lists the subscription you intend to use. Keep the repository-root
+`appsettings.json` uncommitted; prompt 01 generates it with environment-specific resource values.
 
 ## Architecture
 
@@ -25,39 +74,39 @@ LoadGen comparisons.
 
 ```mermaid
 flowchart LR
-	Developer[Developer] --> Prompts[Numbered build and review prompts]
-	AgentKit[Cosmos DB Agent Kit] -. design guidance .-> Prompts
-	Prompts --> Azure[Azure resource provisioning]
-	Azure --> Entra[Microsoft Entra ID and managed identity]
-	Azure --> Cosmos
-	Shell[Azure Cosmos DB Shell] -. inspect and operate .-> Cosmos
+  Developer[Developer] --> Prompts[Numbered build and review prompts]
+  AgentKit[Cosmos DB Agent Kit] -. design guidance .-> Prompts
+  Prompts --> Azure[Azure resource provisioning]
+  Azure --> Entra[Microsoft Entra ID and managed identity]
+  Azure --> Cosmos
+  Shell[Azure Cosmos DB Shell] -. inspect and operate .-> Cosmos
 
-	Seeder[Seeder] -->|bulk upserts| Write
-	LoadGen[LoadGen] -->|HTTP and OpenAPI discovery| Api
+  Seeder[Seeder] -->|bulk upserts| Write
+  LoadGen[LoadGen] -->|HTTP and OpenAPI discovery| Api
 
-	subgraph Api[ASP.NET Core Ticketing API]
-		Controllers[Events and orders controllers] --> Repository[Ticketing repository]
-		ChangeFeed[Change-feed hosted worker]
-	end
+  subgraph Api[ASP.NET Core Ticketing API]
+    Controllers[Events and orders controllers] --> Repository[Ticketing repository]
+    ChangeFeed[Change-feed hosted worker]
+  end
 
-	Api -->|DefaultAzureCredential| Entra
-	Seeder -->|DefaultAzureCredential| Entra
+  Api -->|DefaultAzureCredential| Entra
+  Seeder -->|DefaultAzureCredential| Entra
 
-	subgraph Cosmos[Azure Cosmos DB for NoSQL]
-		Write[(ticketing-write<br/>partition key: /eventId)]
-		EventsByCity[(events-by-city<br/>partition key: /cityKey)]
-		OrdersByCustomer[(orders-by-customer<br/>partition key: /customerId)]
-		Leases[(change-feed-leases<br/>partition key: /id)]
-	end
+  subgraph Cosmos[Azure Cosmos DB for NoSQL]
+    Write[(ticketing-write<br/>partition key: /eventId)]
+    EventsByCity[(events-by-city<br/>partition key: /cityKey)]
+    OrdersByCustomer[(orders-by-customer<br/>partition key: /customerId)]
+    Leases[(change-feed-leases<br/>partition key: /id)]
+  end
 
-	Entra -->|RBAC access tokens| Cosmos
-	Repository -->|events and event orders| Write
-	Repository -->|events by city| EventsByCity
-	Repository -->|orders by customer| OrdersByCustomer
-	Write -->|change feed| ChangeFeed
-	ChangeFeed -->|event projections| EventsByCity
-	ChangeFeed -->|order projections| OrdersByCustomer
-	ChangeFeed --- Leases
+  Entra -->|RBAC access tokens| Cosmos
+  Repository -->|events and event orders| Write
+  Repository -->|events by city| EventsByCity
+  Repository -->|orders by customer| OrdersByCustomer
+  Write -->|change feed| ChangeFeed
+  ChangeFeed -->|event projections| EventsByCity
+  ChangeFeed -->|order projections| OrdersByCustomer
+  ChangeFeed --- Leases
 ```
 
 ## Build sequence
