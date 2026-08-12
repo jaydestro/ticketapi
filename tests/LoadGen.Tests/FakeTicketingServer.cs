@@ -44,17 +44,20 @@ internal sealed class FakeTicketingServer : IAsyncDisposable
     private readonly int _openApiStatus;
     private readonly int _apiStatus;
     private readonly Func<string, int>? _apiStatusResolver;
+    private readonly Func<string, string?> _queryScopeResolver;
 
     public FakeTicketingServer(
         bool includeWriteRoutes = true,
         int openApiStatus = StatusCodes.Ok,
         int apiStatus = StatusCodes.Ok,
-        Func<string, int>? apiStatusResolver = null)
+        Func<string, int>? apiStatusResolver = null,
+        Func<string, string?>? queryScopeResolver = null)
     {
         _openApi = includeWriteRoutes ? FullOpenApi : ComparisonOpenApi;
         _openApiStatus = openApiStatus;
         _apiStatus = apiStatus;
         _apiStatusResolver = apiStatusResolver;
+        _queryScopeResolver = queryScopeResolver ?? GetQueryScope;
         var port = GetAvailablePort();
         BaseUrl = $"http://127.0.0.1:{port}";
         _listener.Prefixes.Add(BaseUrl + "/");
@@ -142,6 +145,11 @@ internal sealed class FakeTicketingServer : IAsyncDisposable
             if (!isOpenApi)
             {
                 context.Response.Headers["x-ms-request-charge"] = "2.5";
+                var queryScope = _queryScopeResolver(path);
+                if (queryScope is not null)
+                {
+                    context.Response.Headers["x-cosmos-query-scope"] = queryScope;
+                }
             }
 
             var bytes = Encoding.UTF8.GetBytes(payload);
@@ -164,10 +172,26 @@ internal sealed class FakeTicketingServer : IAsyncDisposable
         return port;
     }
 
+    private static string GetQueryScope(string path)
+    {
+        if (path.StartsWith("/api/events/event-", StringComparison.Ordinal))
+        {
+            return "point-read";
+        }
+
+        if (path is "/api/events" or "/api/orders")
+        {
+            return "not-applicable";
+        }
+
+        return "cross-partition";
+    }
+
     internal static class StatusCodes
     {
         public const int Ok = 200;
         public const int Unauthorized = 401;
+        public const int TooManyRequests = 429;
         public const int InternalServerError = 500;
     }
 }

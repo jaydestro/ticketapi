@@ -13,7 +13,6 @@ internal static class LoadGenProcess
     public static Task<LoadGenProcessResult> RunAsync(
         string baseUrl,
         string profile,
-        string runLabel,
         double durationSeconds = 0.6,
         int concurrency = 2,
         string? accessToken = null) =>
@@ -25,15 +24,15 @@ internal static class LoadGenProcess
             "--profile", profile,
             "--report-interval", "0.5",
             "--request-timeout", "120",
-            "--seed", "42",
-            "--run-label", runLabel
+            "--seed", "42"
         ], accessToken);
 
     public static async Task<LoadGenProcessResult> RunRawAsync(
         IReadOnlyList<string> arguments,
-        string? accessToken = null)
+        string? accessToken = null,
+        string? logDirectory = null)
     {
-        using var process = Start(arguments, accessToken);
+        using var process = Start(arguments, accessToken, logDirectory);
         var standardOutput = process.StandardOutput.ReadToEndAsync();
         var standardError = process.StandardError.ReadToEndAsync();
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
@@ -53,7 +52,10 @@ internal static class LoadGenProcess
             await standardError);
     }
 
-    public static Process Start(IReadOnlyList<string> arguments, string? accessToken = null)
+    public static Process Start(
+        IReadOnlyList<string> arguments,
+        string? accessToken = null,
+        string? logDirectory = null)
     {
         var startInfo = new ProcessStartInfo("dotnet")
         {
@@ -69,6 +71,9 @@ internal static class LoadGenProcess
 
         startInfo.Environment.Remove("TICKETING_API_ACCESS_TOKEN");
         startInfo.Environment["TICKETING_LOADGEN_LOCK_PATH"] = TestLockPath;
+        startInfo.Environment["LOADGEN_LOG_DIRECTORY"] = logDirectory ?? Path.Combine(
+            Path.GetTempPath(),
+            $"ticketapi-loadgen-test-logs-{Environment.ProcessId}");
         if (accessToken is not null)
         {
             startInfo.Environment["TICKETING_API_ACCESS_TOKEN"] = accessToken;

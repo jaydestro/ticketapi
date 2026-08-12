@@ -15,7 +15,7 @@ public sealed class LoadGenProcessTests
         new[] { "--concurrency", "1", "--report-interval", "0.4" },
         new[] { "--concurrency", "1", "--request-timeout", "0" },
         new[] { "--concurrency", "1", "--request-timeout", "601" },
-        new[] { "--concurrency", "1", "--run-label", "" },
+        new[] { "--concurrency", "1", "--run-label", "obsolete" },
         new[] { "--concurrency", "1", "--unknown" }
     };
 
@@ -29,25 +29,57 @@ public sealed class LoadGenProcessTests
         Assert.Contains("Usage: LoadGen", result.StandardError);
     }
 
-    [Theory]
-    [InlineData("before")]
-    [InlineData("after")]
-    public async Task Comparison_profile_is_read_only_and_labels_output(string label)
+    [Fact]
+    public async Task Completed_run_writes_exact_final_summary_and_prints_path()
+    {
+        var logDirectory = Path.Combine(Path.GetTempPath(), $"loadgen-process-log-{Guid.NewGuid():N}");
+        try
+        {
+            await using var server = new FakeTicketingServer(includeWriteRoutes: false);
+            var result = await LoadGenProcess.RunRawAsync(
+            [
+                "--concurrency", "1",
+                "--duration", "0.1",
+                "--base-url", server.BaseUrl,
+                "--profile", LoadProfiles.Comparison,
+                "--report-interval", "0.5"
+            ], logDirectory: logDirectory);
+
+            Assert.Equal(0, result.ExitCode);
+            var logPath = Assert.Single(Directory.GetFiles(logDirectory, "*.log"));
+            Assert.Contains($"loadgen: summary log: {logPath}", result.StandardOutput);
+            var log = await File.ReadAllTextAsync(logPath);
+            Assert.Contains("=== final: read", log);
+            Assert.Contains("Total used RU:", log);
+            Assert.Contains("XPK", log);
+            Assert.Contains("TOTAL", log);
+        }
+        finally
+        {
+            if (Directory.Exists(logDirectory))
+            {
+                Directory.Delete(logDirectory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Comparison_profile_is_read_only()
     {
         await using var server = new FakeTicketingServer(includeWriteRoutes: false);
 
         var result = await LoadGenProcess.RunAsync(
             server.BaseUrl,
             LoadProfiles.Comparison,
-            label,
             durationSeconds: 0.1,
             concurrency: 1,
             accessToken: "integration-token");
 
         Assert.Equal(0, result.ExitCode);
-        Assert.Contains($"run={label}", result.StandardOutput);
-        Assert.Contains("profile=comparison", result.StandardOutput);
+        Assert.Contains("workload=read", result.StandardOutput);
         Assert.Contains("2.50", result.StandardOutput);
+        Assert.Contains("POINT", result.StandardOutput);
+        Assert.Contains("XPK", result.StandardOutput);
         var traffic = server.Requests.Where(request => request.Path != "/openapi/v1.json").ToArray();
         Assert.NotEmpty(traffic);
         Assert.All(traffic, request => Assert.Equal("GET", request.Method));
@@ -60,6 +92,34 @@ public sealed class LoadGenProcessTests
     }
 
     [Fact]
+    public async Task Saturation_mode_generates_429s_and_holds_after_observation()
+    {
+        var requestCount = 0;
+        await using var server = new FakeTicketingServer(
+            includeWriteRoutes: false,
+            apiStatusResolver: _ => Interlocked.Increment(ref requestCount) > 15
+                ? FakeTicketingServer.StatusCodes.TooManyRequests
+                : FakeTicketingServer.StatusCodes.Ok);
+
+        var result = await LoadGenProcess.RunRawAsync(
+        [
+            "--concurrency", "1",
+            "--duration", "1.1",
+            "--base-url", server.BaseUrl,
+            "--profile", LoadProfiles.Comparison,
+            "--report-interval", "0.5",
+            "--request-timeout", "120",
+            "--seed", "42",
+            "--saturate"
+        ]);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("saturation=adaptive", result.StandardOutput);
+        Assert.Contains("saturation=holding", result.StandardOutput);
+        Assert.True(requestCount > 15);
+    }
+
+    [Fact]
     public async Task Mixed_profile_exercises_every_operation_and_write_contract()
     {
         await using var server = new FakeTicketingServer();
@@ -67,7 +127,6 @@ public sealed class LoadGenProcessTests
         var result = await LoadGenProcess.RunAsync(
             server.BaseUrl,
             LoadProfiles.Mixed,
-            "root",
             durationSeconds: 0.1,
             concurrency: 1,
             accessToken: "write-token");
@@ -101,7 +160,7 @@ public sealed class LoadGenProcessTests
     {
         await using var server = new FakeTicketingServer(includeWriteRoutes: false);
 
-        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Mixed, "root");
+        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Mixed);
 
         Assert.Equal(2, result.ExitCode);
         Assert.Contains("missing required mixed route", result.StandardOutput, StringComparison.OrdinalIgnoreCase);
@@ -115,7 +174,7 @@ public sealed class LoadGenProcessTests
         await using var server = new FakeTicketingServer(
             openApiStatus: FakeTicketingServer.StatusCodes.Unauthorized);
 
-        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Comparison, "before");
+        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Comparison);
 
         Assert.Equal(2, result.ExitCode);
         Assert.Contains("Ticketing.Read access", result.StandardOutput);
@@ -127,11 +186,11 @@ public sealed class LoadGenProcessTests
         await using var server = new FakeTicketingServer(
             apiStatus: FakeTicketingServer.StatusCodes.InternalServerError);
 
-        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Comparison, "before");
+        var result = await LoadGenProcess.RunAsync(server.BaseUrl, LoadProfiles.Comparison);
 
         Assert.Equal(4, result.ExitCode);
         Assert.Contains("no requests succeeded", result.StandardError);
-        Assert.Contains("run=before", result.StandardOutput);
+        Assert.Contains("workload=read", result.StandardOutput);
     }
 
     [Fact]
@@ -145,7 +204,6 @@ public sealed class LoadGenProcessTests
         var result = await LoadGenProcess.RunAsync(
             server.BaseUrl,
             LoadProfiles.Comparison,
-            "before",
             durationSeconds: 0.1,
             concurrency: 1);
 
@@ -160,14 +218,12 @@ public sealed class LoadGenProcessTests
         var first = LoadGenProcess.RunAsync(
             server.BaseUrl,
             LoadProfiles.Comparison,
-            "before",
             durationSeconds: 2);
         await server.WaitForTrafficAsync(TimeSpan.FromSeconds(5));
 
         var second = await LoadGenProcess.RunAsync(
             server.BaseUrl,
             LoadProfiles.Comparison,
-            "after",
             durationSeconds: 0.2);
 
         Assert.Equal(3, second.ExitCode);
@@ -182,8 +238,7 @@ public sealed class LoadGenProcessTests
         [
             "--concurrency", "1",
             "--duration", "0.1",
-            "--base-url", "http://example.com",
-            "--run-label", "deployed"
+            "--base-url", "http://example.com"
         ], "token");
 
         Assert.Equal(1, result.ExitCode);

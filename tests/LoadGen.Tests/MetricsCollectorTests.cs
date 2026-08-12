@@ -11,6 +11,8 @@ public sealed class MetricsCollectorTests
         metrics.RecordCompleted(RequestKind.EventDetail, 200, 2.5, TimeSpan.FromMilliseconds(6));
         metrics.RecordSent(RequestKind.EventsByCity);
         metrics.RecordCompleted(RequestKind.EventsByCity, 404, null, TimeSpan.FromMilliseconds(60));
+        metrics.RecordSent(RequestKind.UpcomingEvents);
+        metrics.RecordCompleted(RequestKind.UpcomingEvents, 429, 1.25, TimeSpan.FromMilliseconds(30));
         metrics.RecordSent(RequestKind.OrdersByEvent);
         metrics.RecordCompleted(RequestKind.OrdersByEvent, 503, 8.25, TimeSpan.FromMilliseconds(600));
         metrics.RecordSent(RequestKind.OrdersByCustomer);
@@ -20,14 +22,18 @@ public sealed class MetricsCollectorTests
 
         Assert.Equal(1, snapshot[RequestKind.EventDetail].Success);
         Assert.Equal(1, snapshot[RequestKind.EventsByCity].ClientErrors);
+        Assert.Equal(1, snapshot[RequestKind.UpcomingEvents].Throttled);
+        Assert.Equal(0, snapshot[RequestKind.UpcomingEvents].ClientErrors);
         Assert.Equal(1, snapshot[RequestKind.OrdersByEvent].ServerErrors);
         Assert.Equal(1, snapshot[RequestKind.OrdersByCustomer].NetworkErrors);
         Assert.Equal(2.5, snapshot[RequestKind.EventDetail].RequestCharge);
         Assert.Equal(6, MetricsCollector.GetPercentileMilliseconds(
             snapshot[RequestKind.EventDetail].Histogram, 0.95));
-        Assert.Equal(4, snapshot.Total.Sent);
-        Assert.Equal(4, snapshot.Total.Completed);
-        Assert.Equal(10.75, snapshot.Total.RequestCharge);
+        Assert.Equal(5, snapshot.Total.Sent);
+        Assert.Equal(0, snapshot.Total.Active);
+        Assert.Equal(5, snapshot.Total.Completed);
+        Assert.Equal(1, snapshot.Total.Throttled);
+        Assert.Equal(12, snapshot.Total.RequestCharge);
     }
 
     [Fact]
@@ -39,10 +45,12 @@ public sealed class MetricsCollectorTests
         var previous = metrics.Snapshot();
 
         metrics.RecordSent(RequestKind.UpcomingEvents);
+        Assert.Equal(1, metrics.Snapshot()[RequestKind.UpcomingEvents].Active);
         metrics.RecordCompleted(RequestKind.UpcomingEvents, 200, 4, TimeSpan.FromMilliseconds(50));
         var delta = metrics.Snapshot()[RequestKind.UpcomingEvents] - previous[RequestKind.UpcomingEvents];
 
         Assert.Equal(1, delta.Sent);
+        Assert.Equal(0, delta.Active);
         Assert.Equal(1, delta.Success);
         Assert.Equal(4, delta.RequestCharge);
         Assert.Equal(50, delta.TotalMilliseconds);
@@ -75,6 +83,40 @@ public sealed class MetricsCollectorTests
         Assert.Equal(0, MetricsCollector.GetPercentileMilliseconds(
             metrics.Snapshot()[RequestKind.EventDetail].Histogram,
             0.95));
+    }
+
+    [Fact]
+    public void Query_scope_tracks_observed_values_and_reports_conflicts()
+    {
+        var metrics = new MetricsCollector();
+        metrics.RecordSent(RequestKind.UpcomingEvents);
+        metrics.RecordCompleted(
+            RequestKind.UpcomingEvents,
+            200,
+            3,
+            CosmosQueryScope.CrossPartition,
+            TimeSpan.FromMilliseconds(10));
+
+        Assert.Equal(
+            CosmosQueryScope.CrossPartition,
+            metrics.Snapshot()[RequestKind.UpcomingEvents].QueryScope);
+
+        metrics.RecordSent(RequestKind.UpcomingEvents);
+        metrics.RecordCompleted(
+            RequestKind.UpcomingEvents,
+            200,
+            1,
+            CosmosQueryScope.SinglePartition,
+            TimeSpan.FromMilliseconds(10));
+
+        Assert.Equal(
+            CosmosQueryScope.Mixed,
+            metrics.Snapshot()[RequestKind.UpcomingEvents].QueryScope);
+
+        metrics.Reset();
+        Assert.Equal(
+            CosmosQueryScope.Unknown,
+            metrics.Snapshot()[RequestKind.UpcomingEvents].QueryScope);
     }
 
     [Fact]

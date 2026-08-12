@@ -35,6 +35,30 @@ builder.Services.AddSingleton<ITicketingRepository, TicketingRepository>();
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (CosmosException exception) when (exception.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+    {
+        context.Response.Clear();
+        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        context.Response.Headers["x-ms-request-charge"] = exception.RequestCharge.ToString(
+            System.Globalization.CultureInfo.InvariantCulture);
+        if (exception.Data[CosmosQueryScopes.ExceptionDataKey] is string queryScope)
+        {
+            context.Response.Headers["x-cosmos-query-scope"] = queryScope;
+        }
+        if (exception.RetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero)
+        {
+            context.Response.Headers.RetryAfter = Math.Ceiling(retryAfter.TotalSeconds)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+    }
+});
+
 app.MapOpenApi();
 app.MapControllers();
 

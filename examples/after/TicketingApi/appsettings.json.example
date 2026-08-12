@@ -1,0 +1,27 @@
+{
+	"Authentication": {
+		"_comment": "Required outside the Development environment. Configure both values to protect all API and OpenAPI routes with JWT bearer authentication; health routes remain anonymous.",
+		"Authority": "",
+		"Audience": ""
+	},
+	"CosmosDb": {
+		"_authenticationComment": "For Azure, set AccountEndpoint and leave ConnectionString empty to use DefaultAzureCredential. For the local emulator or key-based authentication, set ConnectionString and leave AccountEndpoint empty.",
+		"_connectionStringComment": "The full Azure Cosmos DB connection string. Use this for the local emulator or key-based authentication.",
+		"ConnectionString": "",
+		"_accountEndpointComment": "The Azure Cosmos DB account URI, for example https://your-account.documents.azure.com:443/. This uses Microsoft Entra ID authentication.",
+		"AccountEndpoint": "",
+		"_managedIdentityClientIdComment": "The client ID of the user-assigned managed identity attached to the production API host.",
+		"ManagedIdentityClientId": "",
+		"_databaseNameComment": "The name of the Cosmos DB database that contains the ticketing data.",
+		"DatabaseName": "",
+		"_ticketingContainerNameComment": "Transactional source container, partitioned by /eventId.",
+		"TicketingContainerName": "ticketing-write",
+		"_eventsByCityContainerNameComment": "Event read model, partitioned by /cityKey.",
+		"EventsByCityContainerName": "events-by-city",
+		"_ordersByCustomerContainerNameComment": "Customer order read model, partitioned by /customerId.",
+		"OrdersByCustomerContainerName": "orders-by-customer",
+		"LeaseContainerName": "change-feed-leases",
+		"ChangeFeedProcessorName": "ticketing-read-models-v1",
+		"SlowOperationThresholdMilliseconds": 250
+	}
+}

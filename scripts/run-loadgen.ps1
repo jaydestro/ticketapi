@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 4000)]
-    [int]$Concurrency = 50,
+    [int]$Concurrency = 30,
 
     [int]$Seed,
 
@@ -9,12 +9,12 @@ param(
 
     [string]$AccessToken = $env:TICKETING_API_ACCESS_TOKEN,
 
-    [ValidateSet('Comparison', 'Mixed')]
-    [string]$Workload = 'Comparison',
+    [ValidateSet('Read', 'Mixed', 'Comparison')]
+    [string]$Workload = 'Read',
 
-    [string]$ApiDirectory = 'TicketingApi',
+    [string]$ApiDirectory,
 
-    [string]$RunLabel,
+    [string]$LogDirectory = 'logs\loadgen',
 
     [ValidateRange(0.1, 86400)]
     [double]$Duration,
@@ -23,13 +23,163 @@ param(
     [double]$RequestTimeout = 120,
 
     [ValidateRange(0.5, 60)]
-    [double]$ReportInterval = 2
+    [double]$ReportInterval = 0.5,
+
+    [switch]$Saturate,
+
+    [switch]$Prompt,
+
+    [switch]$NoPrompt
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ($Prompt -and $NoPrompt) {
+    throw 'Use either -Prompt or -NoPrompt, not both.'
+}
+
+function Read-Choice {
+    param(
+        [string]$Message,
+        [string[]]$Choices,
+        [int]$DefaultIndex = 0
+    )
+
+    while ($true) {
+        for ($index = 0; $index -lt $Choices.Count; $index++) {
+            Write-Host "  $($index + 1)) $($Choices[$index])"
+        }
+        $answer = Read-Host "$Message [$($DefaultIndex + 1)]"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $DefaultIndex
+        }
+        $selected = 0
+        if ([int]::TryParse($answer, [ref]$selected) -and $selected -ge 1 -and $selected -le $Choices.Count) {
+            return $selected - 1
+        }
+        Write-Warning "Enter a number from 1 to $($Choices.Count)."
+    }
+}
+
+function Read-Number {
+    param(
+        [string]$Message,
+        [double]$Default,
+        [double]$Minimum,
+        [double]$Maximum
+    )
+
+    while ($true) {
+        $answer = Read-Host "$Message [$Default]"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $Default
+        }
+        $value = 0.0
+        if ([double]::TryParse(
+            $answer,
+            [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$value) -and $value -ge $Minimum -and $value -le $Maximum) {
+            return $value
+        }
+        Write-Warning "Enter a number from $Minimum to $Maximum."
+    }
+}
+
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $projectPath = Join-Path $repositoryRoot 'LoadGen\LoadGen.csproj'
+$durationWasSet = $PSBoundParameters.ContainsKey('Duration')
+$seedWasSet = $PSBoundParameters.ContainsKey('Seed')
+$isNonInteractive = [Console]::IsInputRedirected -or
+    ([Environment]::GetCommandLineArgs() -contains '-NonInteractive')
+$explicitParameters = @($PSBoundParameters.Keys | Where-Object { $_ -notin @('Prompt', 'NoPrompt') })
+$usePrompt = $Prompt -or (-not $NoPrompt -and -not $isNonInteractive -and $explicitParameters.Count -eq 0)
+
+if ($usePrompt) {
+    Write-Host ''
+    Write-Host 'Ticketing LoadGen setup' -ForegroundColor Cyan
+    Write-Host 'Press Enter to accept each default.'
+    Write-Host ''
+
+    while ([string]::IsNullOrWhiteSpace($ApiDirectory)) {
+        $ApiDirectory = Read-Host 'Directory containing TicketingApi.csproj'
+    }
+
+    $workloadIndex = Read-Choice 'Workload' @('Read - five read-only API operations', 'Mixed - reads and writes')
+    $Workload = if ($workloadIndex -eq 0) { 'Read' } else { 'Mixed' }
+    $Concurrency = [int](Read-Number 'Concurrency' 30 1 4000)
+    $saturationAnswer = Read-Host 'Adaptively increase concurrency until HTTP 429 throttling appears? [y/N]'
+    $Saturate = $saturationAnswer -match '^(y|yes)$'
+
+    while ($true) {
+        $durationAnswer = Read-Host 'Duration in seconds, or Enter for unlimited'
+        if ([string]::IsNullOrWhiteSpace($durationAnswer)) {
+            $durationWasSet = $false
+            break
+        }
+        $parsedDuration = 0.0
+        if ([double]::TryParse(
+            $durationAnswer,
+            [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedDuration) -and $parsedDuration -ge 0.1 -and $parsedDuration -le 86400) {
+            $Duration = $parsedDuration
+            $durationWasSet = $true
+            break
+        }
+        Write-Warning 'Enter a duration from 0.1 to 86400 seconds, or press Enter for unlimited.'
+    }
+
+    $RequestTimeout = Read-Number 'Request timeout in seconds' 120 1 600
+    while ($true) {
+        $urlAnswer = Read-Host "API base URL [$BaseUrl]"
+        if ([string]::IsNullOrWhiteSpace($urlAnswer)) {
+            break
+        }
+        $parsedUrl = $null
+        if ([uri]::TryCreate($urlAnswer, [UriKind]::Absolute, [ref]$parsedUrl) -and
+            $parsedUrl.Scheme -in @('http', 'https')) {
+            $BaseUrl = $parsedUrl
+            break
+        }
+        Write-Warning 'Enter an absolute HTTP or HTTPS URL.'
+    }
+    $ReportInterval = Read-Number 'Dashboard refresh interval in seconds' 0.5 0.5 60
+
+    $seedAnswer = Read-Host 'Random seed, or Enter for a random seed'
+    if ([string]::IsNullOrWhiteSpace($seedAnswer)) {
+        $seedWasSet = $false
+    }
+    else {
+        $parsedSeed = 0
+        if (-not [int]::TryParse($seedAnswer, [ref]$parsedSeed)) {
+            throw 'Seed must be a whole number.'
+        }
+        $Seed = $parsedSeed
+        $seedWasSet = $true
+    }
+
+    $durationSummary = if ($durationWasSet) { "$Duration seconds" } else { 'unlimited' }
+    Write-Host ''
+    Write-Host 'Selected settings' -ForegroundColor Cyan
+    Write-Host "  Target:      $ApiDirectory"
+    Write-Host "  Workload:    $Workload"
+    Write-Host "  Concurrency: $Concurrency"
+    Write-Host "  Saturation:  $(if ($Saturate) { 'adaptive' } else { 'off' })"
+    Write-Host "  Duration:    $durationSummary"
+    Write-Host "  Timeout:     $RequestTimeout seconds"
+    Write-Host "  URL:         $BaseUrl"
+    $confirmation = Read-Host 'Start LoadGen? [Y/n]'
+    if ($confirmation -match '^(n|no)$') {
+        Write-Host 'Cancelled.'
+        return
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($ApiDirectory)) {
+    throw 'ApiDirectory is required. Run interactively to be prompted, or pass -ApiDirectory with the directory containing TicketingApi.csproj.'
+}
+
 $apiDirectoryPath = if ([System.IO.Path]::IsPathRooted($ApiDirectory)) {
     $ApiDirectory
 }
@@ -38,21 +188,21 @@ else {
 }
 $apiDirectoryPath = [System.IO.Path]::GetFullPath($apiDirectoryPath)
 $apiProjectPath = Join-Path $apiDirectoryPath 'TicketingApi.csproj'
+$logDirectoryPath = if ([System.IO.Path]::IsPathRooted($LogDirectory)) {
+    $LogDirectory
+}
+else {
+    Join-Path $repositoryRoot $LogDirectory
+}
+$logDirectoryPath = [System.IO.Path]::GetFullPath($logDirectoryPath)
 $appSettingsPath = Join-Path $repositoryRoot 'appsettings.json'
 $targetUrl = $BaseUrl.AbsoluteUri.TrimEnd('/')
 $openApiUrl = "$targetUrl/openapi/v1.json"
+$loadProfile = if ($Workload -eq 'Mixed') { 'mixed' } else { 'comparison' }
+$workloadName = if ($Workload -eq 'Mixed') { 'Mixed' } else { 'Read' }
 
-if ([string]::IsNullOrWhiteSpace($RunLabel)) {
-    $rootApiDirectory = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'TicketingApi'))
-    if ($apiDirectoryPath -eq $rootApiDirectory) {
-        $RunLabel = 'root'
-    }
-    elseif ((Split-Path -Leaf $apiDirectoryPath) -eq 'TicketingApi') {
-        $RunLabel = Split-Path -Leaf (Split-Path -Parent $apiDirectoryPath)
-    }
-    else {
-        $RunLabel = Split-Path -Leaf $apiDirectoryPath
-    }
+if (-not (Test-Path -LiteralPath $apiProjectPath -PathType Leaf)) {
+    throw "The API project does not exist at '$apiProjectPath'. Set -ApiDirectory to the directory containing TicketingApi.csproj."
 }
 
 if (-not $BaseUrl.IsLoopback -and $BaseUrl.Scheme -ne 'https') {
@@ -61,10 +211,6 @@ if (-not $BaseUrl.IsLoopback -and $BaseUrl.Scheme -ne 'https') {
 
 if ([string]::IsNullOrWhiteSpace($AccessToken)) {
     if ($BaseUrl.IsLoopback) {
-        if (-not (Test-Path -LiteralPath $apiProjectPath -PathType Leaf)) {
-            throw "The API project does not exist at '$apiProjectPath'. Set -ApiDirectory to the directory containing TicketingApi.csproj."
-        }
-
         $scopes = @('Ticketing.Read')
         if ($Workload -eq 'Mixed') {
             $scopes += 'Ticketing.Write'
@@ -131,38 +277,45 @@ $loadGenArguments = @(
     '--base-url'
     $targetUrl
     '--profile'
-    $Workload.ToLowerInvariant()
+    $loadProfile
     '--report-interval'
     $ReportInterval
     '--request-timeout'
     $RequestTimeout
-    '--run-label'
-    $RunLabel
 )
 
-if ($PSBoundParameters.ContainsKey('Seed')) {
+if ($seedWasSet) {
     $loadGenArguments += @('--seed', $Seed)
 }
 
-if ($PSBoundParameters.ContainsKey('Duration')) {
+if ($durationWasSet) {
     $loadGenArguments += @('--duration', $Duration)
 }
 
-$durationDescription = if ($PSBoundParameters.ContainsKey('Duration')) { "$Duration seconds" } else { 'until Ctrl+C' }
-Write-Host "Starting run '$RunLabel': $Workload LoadGen against $targetUrl with base concurrency $Concurrency for $durationDescription (request timeout: $RequestTimeout seconds)."
-if (-not $PSBoundParameters.ContainsKey('Duration')) {
+if ($Saturate) {
+    $loadGenArguments += '--saturate'
+}
+
+$durationDescription = if ($durationWasSet) { "$Duration seconds" } else { 'until Ctrl+C' }
+$saturationDescription = if ($Saturate) { 'adaptive saturation enabled' } else { 'saturation off' }
+Write-Host "Starting $workloadName LoadGen against $targetUrl using $apiProjectPath with base concurrency $Concurrency for $durationDescription (request timeout: $RequestTimeout seconds; $saturationDescription)."
+Write-Host "Summary log directory: $logDirectoryPath"
+if (-not $durationWasSet) {
     Write-Host 'Press Ctrl+C to stop and print final request-unit totals.'
 }
 
 $previousToken = $env:TICKETING_API_ACCESS_TOKEN
+$previousLogDirectory = $env:LOADGEN_LOG_DIRECTORY
 try {
     if (-not [string]::IsNullOrWhiteSpace($AccessToken)) {
         $env:TICKETING_API_ACCESS_TOKEN = $AccessToken
     }
+    $env:LOADGEN_LOG_DIRECTORY = $logDirectoryPath
 
     & dotnet @loadGenArguments
     exit $LASTEXITCODE
 }
 finally {
     $env:TICKETING_API_ACCESS_TOKEN = $previousToken
+    $env:LOADGEN_LOG_DIRECTORY = $previousLogDirectory
 }

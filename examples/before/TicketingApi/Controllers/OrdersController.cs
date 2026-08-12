@@ -16,7 +16,7 @@ public sealed class OrdersController(ITicketingRepository repository) : Controll
         try
         {
             var result = await repository.PurchaseTicketsAsync(request, cancellationToken);
-            AddRequestCharge(result.RequestCharge);
+            AddCosmosMetadata(result.RequestCharge, result.QueryScope);
             return result.Value is null ? NotFound() : CreatedAtAction(
                 nameof(GetByEvent),
                 new { eventId = result.Value.EventId },
@@ -39,7 +39,7 @@ public sealed class OrdersController(ITicketingRepository repository) : Controll
         CancellationToken cancellationToken)
     {
         var result = await repository.GetOrdersByCustomerAsync(customerId, cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return Ok(result.Value);
     }
 
@@ -49,11 +49,14 @@ public sealed class OrdersController(ITicketingRepository repository) : Controll
         CancellationToken cancellationToken)
     {
         var result = await repository.GetOrdersByEventAsync(eventId, cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return Ok(result.Value);
     }
 
-    private void AddRequestCharge(double requestCharge) =>
+    private void AddCosmosMetadata(double requestCharge, string queryScope)
+    {
         Response.Headers["x-ms-request-charge"] = requestCharge.ToString(
             System.Globalization.CultureInfo.InvariantCulture);
+        Response.Headers["x-cosmos-query-scope"] = queryScope;
+    }
 }

@@ -20,4 +20,4 @@ Is this ready for production?
 
 ## Repair
 
-Review this whole thing for production readiness and fix what you find.  Focus on code correctness and less on infrastructure.  Use Azure Cosmos DB best practices.  Skip LoadGen and Seeder, those are supportive apps.
+Review this whole thing for production readiness and fix what you find.  Focus on code correctness and less on infrastructure aside from correct database and containere. Use Azure Cosmos DB best practices.  Skip LoadGen and Seeder, those are supportive apps.

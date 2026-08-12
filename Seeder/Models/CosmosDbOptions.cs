@@ -16,4 +16,12 @@ public class CosmosDbOptions
     public string EventsContainerName { get; set; } = "Events";
 
     public string OrdersContainerName { get; set; } = "Orders";
+
+    public string TicketingContainerName { get; set; } = "ticketing-write";
+
+    public string EventsByCityContainerName { get; set; } = "events-by-city";
+
+    public string OrdersByCustomerContainerName { get; set; } = "orders-by-customer";
+
+    public string LeaseContainerName { get; set; } = "change-feed-leases";
 }

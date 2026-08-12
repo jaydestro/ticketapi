@@ -9,7 +9,7 @@ using static LoadGenConstants;
 // and prints recurring per-operation latency, status, and RU comparisons.
 // Usage: LoadGen --concurrency <n> [--profile mixed|comparison] [--report-interval <seconds>]
 //                [--request-timeout <seconds>] [--seed <n>] [--duration <seconds>]
-//                [--base-url <url>] [--run-label <label>]
+//                [--base-url <url>] [--saturate]
 
 var parsed = ParseArgs(args);
 if (parsed is null)
@@ -17,11 +17,11 @@ if (parsed is null)
     Console.Error.WriteLine(
         "Usage: LoadGen --concurrency <n> [--profile mixed|comparison] " +
         "[--report-interval <seconds>] [--seed <n>] [--duration <seconds>] " +
-        "[--request-timeout <seconds>] [--base-url <url>] [--run-label <label>]");
+        "[--request-timeout <seconds>] [--base-url <url>] [--saturate]");
     return 1;
 }
 
-var (requestedSeed, baseConcurrency, durationSeconds, baseUrl, profile, reportIntervalSeconds, runLabel, requestTimeoutSeconds) = parsed;
+var (requestedSeed, baseConcurrency, durationSeconds, baseUrl, profile, reportIntervalSeconds, requestTimeoutSeconds, saturate) = parsed;
 var instanceLock = TryAcquireInstanceLock();
 if (instanceLock is null)
 {
@@ -32,8 +32,7 @@ if (instanceLock is null)
 using var instanceLockHandle = instanceLock;
 // --seed only controls RNG reproducibility for the traffic shape; random by default so it's not required.
 var seed = requestedSeed ?? Random.Shared.Next();
-var openEnded = durationSeconds is null;
-var duration = durationSeconds is { } d ? TimeSpan.FromSeconds(d) : Timeout.InfiniteTimeSpan;
+var initialDuration = durationSeconds is { } d ? TimeSpan.FromSeconds(d) : (TimeSpan?)null;
 
 // Same city list the seeder uses, so "events by city" hits cities that actually exist.
 string[] cities =
@@ -71,8 +70,8 @@ string[] priceTiers = ["Economy", "Standard", "Premium", "VIP"];
     (RequestKind.CreateEvent, 1)
 ];
 
-// Stable, read-only mix for before/after comparisons. It includes the query shapes previously
-// responsible for the largest RU and latency costs, plus a point-read control.
+// Stable, read-only mix for repeatable comparisons. It includes the query shapes expected to
+// produce the largest RU and latency costs, plus a point-read control.
 (RequestKind Kind, double Weight)[] comparisonWeights =
 [
     (RequestKind.EventDetail, 10),
@@ -128,7 +127,10 @@ if (!await DiscoverRoutesAsync(http, routes, profile))
 
 var rng = new Random(seed);
 var stopwatch = Stopwatch.StartNew();
+var refreshStopwatch = Stopwatch.StartNew();
 var metrics = new MetricsCollector();
+var controls = new LoadGenRuntimeControls(baseConcurrency, initialDuration);
+var saturation = new LoadGenSaturationController(saturate, baseConcurrency);
 
 // Ctrl+C should stop launching new requests and drain in-flight ones, not kill the process outright.
 using var stopRequested = new CancellationTokenSource();
@@ -143,11 +145,12 @@ var lastReportElapsed = TimeSpan.Zero;
 var previousSnapshot = metrics.Snapshot();
 var dashboard = new LiveDashboard();
 AppDomain.CurrentDomain.ProcessExit += (_, _) => dashboard.Complete();
+var workloadName = LoadGenProfiles.GetDisplayName(profile);
 
 Console.WriteLine(
-    $"loadgen: run={runLabel} profile={profile} seed={seed} concurrency={baseConcurrency} " +
-    $"duration={(openEnded ? "until Ctrl+C" : $"{durationSeconds}s")} " +
-    $"request-timeout={requestTimeoutSeconds}s target={baseUrl}");
+    $"loadgen: workload={workloadName} seed={seed} concurrency={baseConcurrency} " +
+    $"duration={LoadGenRuntimeControls.FormatDuration(initialDuration)} " +
+    $"request-timeout={requestTimeoutSeconds}s saturation={(saturate ? "adaptive" : "off")} target={baseUrl}");
 if (profile == LoadProfiles.Comparison)
 {
     Console.WriteLine(
@@ -155,39 +158,52 @@ if (profile == LoadProfiles.Comparison)
         "customer-order, and hot-event-order queries");
 }
 
-// Start one request for every operation in the selected workload before weighted traffic.
-// This makes short diagnostic runs complete and comparable instead of relying on random chance.
-foreach (var kind in LoadGenProfiles.GetRequestKinds(profile))
+var mandatoryKinds = new Queue<RequestKind>(LoadGenProfiles.GetRequestKinds(profile));
+if (!saturate)
 {
-    var (method, path, body) = CreateRequest(kind, rng, profile);
-    inFlight.Add(SendAsync(http, kind, method, path, body));
-    metrics.RecordSent(kind);
+    // Normal runs start one request for every operation so short diagnostics do not rely on chance.
+    while (mandatoryKinds.TryDequeue(out var kind))
+    {
+        var (method, path, body) = CreateRequest(kind, rng, profile);
+        inFlight.Add(SendAsync(http, kind, method, path, body));
+        metrics.RecordSent(kind);
+    }
 }
 
-while (!stopRequested.IsCancellationRequested && (openEnded || stopwatch.Elapsed < duration))
+while (!stopRequested.IsCancellationRequested &&
+       (controls.Duration is null || stopwatch.Elapsed < controls.Duration))
 {
     inFlight.RemoveAll(t => t.IsCompleted);
+    ProcessPendingKeys();
 
     var elapsed = stopwatch.Elapsed;
     var cyclePosition = elapsed.TotalSeconds % BurstPeriodSeconds;
-    var inBurst = profile == LoadProfiles.Mixed && cyclePosition < BurstDurationSeconds;
-    var targetConcurrency = inBurst ? baseConcurrency * BurstMultiplier : baseConcurrency;
+    var inBurst = !saturate && profile == LoadProfiles.Mixed && cyclePosition < BurstDurationSeconds;
+    var targetConcurrency = saturate
+        ? saturation.TargetConcurrency
+        : inBurst
+        ? Math.Min(4_000, controls.Concurrency * BurstMultiplier)
+        : controls.Concurrency;
 
-    while (inFlight.Count < targetConcurrency && !stopRequested.IsCancellationRequested &&
-           (openEnded || stopwatch.Elapsed < duration))
+    while (!controls.IsPaused &&
+           inFlight.Count < targetConcurrency && !stopRequested.IsCancellationRequested &&
+            (controls.Duration is null || stopwatch.Elapsed < controls.Duration))
     {
-        var kind = PickKind(rng, inBurst, profile);
+        var kind = mandatoryKinds.TryDequeue(out var mandatoryKind)
+            ? mandatoryKind
+            : PickKind(rng, inBurst, profile);
         var (method, path, body) = CreateRequest(kind, rng, profile);
         inFlight.Add(SendAsync(http, kind, method, path, body));
         metrics.RecordSent(kind);
     }
 
-    if ((elapsed - lastReportElapsed).TotalSeconds >= reportIntervalSeconds)
+    var refreshElapsed = refreshStopwatch.Elapsed;
+    if ((refreshElapsed - lastReportElapsed).TotalSeconds >= reportIntervalSeconds)
     {
         var currentSnapshot = metrics.Snapshot();
+        saturation.ObserveAndAdvance(currentSnapshot.Total.Throttled, controls.IsPaused);
         PrintIntervalReport(
             dashboard,
-            runLabel,
             profile,
             inBurst,
             targetConcurrency,
@@ -196,7 +212,7 @@ while (!stopRequested.IsCancellationRequested && (openEnded || stopwatch.Elapsed
             previousSnapshot,
             currentSnapshot);
         previousSnapshot = currentSnapshot;
-        lastReportElapsed = elapsed;
+        lastReportElapsed = refreshElapsed;
     }
 
     await Task.Delay(20);
@@ -207,7 +223,7 @@ Console.WriteLine($"loadgen: stopping - draining {inFlight.Count} in-flight requ
 await Task.WhenAll(inFlight);
 
 var finalSnapshot = metrics.Snapshot();
-PrintFinalReport(runLabel, profile, stopwatch.Elapsed, finalSnapshot);
+PrintFinalReport(profile, stopwatch.Elapsed, finalSnapshot, dashboard.Width);
 if (finalSnapshot.Total.Success == 0)
 {
     Console.Error.WriteLine("loadgen: no requests succeeded; check the API routes, data, and access token.");
@@ -227,6 +243,43 @@ if (unsuccessfulOperations.Length > 0)
 }
 
 return 0;
+
+void ProcessPendingKeys()
+{
+    while (dashboard.TryReadKey(out var key))
+    {
+        var previousConcurrency = controls.Concurrency;
+        switch (controls.Handle(key))
+        {
+            case LoadGenControlAction.Paused:
+                stopwatch.Stop();
+                break;
+            case LoadGenControlAction.Resumed:
+                stopwatch.Start();
+                break;
+            case LoadGenControlAction.Reset:
+                metrics.Reset();
+                previousSnapshot = metrics.Snapshot();
+                if (controls.IsPaused)
+                {
+                    stopwatch.Reset();
+                }
+                else
+                {
+                    stopwatch.Restart();
+                }
+                break;
+            case LoadGenControlAction.Stop:
+                stopRequested.Cancel();
+                break;
+        }
+
+        if (saturation.Enabled && controls.Concurrency != previousConcurrency)
+            {
+            saturation.SetTarget(controls.Concurrency);
+            }
+    }
+}
 
 RequestKind PickKind(
     Random r,
@@ -443,6 +496,10 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
         }
 
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        if ((int)response.StatusCode == 429)
+        {
+            saturation.ObserveThrottling();
+        }
 
         double? charge = null;
         if (response.Headers.TryGetValues("x-ms-request-charge", out var values) &&
@@ -455,9 +512,18 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
             charge = parsedCharge;
         }
 
+        var queryScope = response.Headers.TryGetValues("x-cosmos-query-scope", out var scopeValues)
+            ? CosmosQueryScopeExtensions.Parse(scopeValues.FirstOrDefault())
+            : CosmosQueryScope.Unknown;
+
         await response.Content.CopyToAsync(Stream.Null);
         requestStopwatch.Stop();
-        metrics.RecordCompleted(kind, (int)response.StatusCode, charge, requestStopwatch.Elapsed);
+        metrics.RecordCompleted(
+            kind,
+            (int)response.StatusCode,
+            charge,
+            queryScope,
+            requestStopwatch.Elapsed);
     }
     catch (Exception)
     {
@@ -468,7 +534,6 @@ async Task SendAsync(HttpClient client, RequestKind kind, HttpMethod method, str
 
 void PrintIntervalReport(
     LiveDashboard liveDashboard,
-    string runLabel,
     string selectedProfile,
     bool inBurst,
     int targetConcurrency,
@@ -477,22 +542,34 @@ void PrintIntervalReport(
     MetricsSnapshot previous,
     MetricsSnapshot current)
 {
-    liveDashboard.Render(LoadGenReportFormatter.FormatInterval(
-        runLabel,
+    liveDashboard.Render(LoadGenLiveDashboardFormatter.Format(
         selectedProfile,
         inBurst,
         targetConcurrency,
         elapsed,
-        interval,
-        previous,
+        new DashboardRenderContext(
+            controls.IsPaused,
+            controls.Duration,
+            liveDashboard.IsInteractive,
+            saturation.Enabled,
+            saturation.ThrottlingObserved,
+            saturation.IsAtMaximum),
         current,
         liveDashboard.Width,
         DateTimeOffset.Now));
 }
 
-void PrintFinalReport(string runLabel, string selectedProfile, TimeSpan elapsed, MetricsSnapshot snapshot)
+void PrintFinalReport(
+    string selectedProfile,
+    TimeSpan elapsed,
+    MetricsSnapshot snapshot,
+    int width)
 {
-    foreach (var line in LoadGenReportFormatter.FormatFinal(runLabel, selectedProfile, elapsed, snapshot))
+    foreach (var line in LoadGenLiveDashboardFormatter.FormatFinal(
+        selectedProfile,
+        elapsed,
+        snapshot,
+        width))
     {
         Console.WriteLine(line);
     }
@@ -527,9 +604,9 @@ LoadGenOptions? ParseArgs(string[] a)
     double? parsedDuration = null;
     var url = "http://localhost:5107";
     var selectedProfile = LoadProfiles.Mixed;
-    var reportInterval = 2.0;
-    var runLabel = "root";
+    var reportInterval = 0.5;
     var requestTimeout = 120.0;
+    var saturate = false;
 
     for (var i = 0; i < a.Length; i++)
     {
@@ -570,10 +647,6 @@ LoadGenOptions? ParseArgs(string[] a)
                 reportInterval = interval;
                 i++;
                 break;
-            case "--run-label" when i + 1 < a.Length:
-                runLabel = a[i + 1];
-                i++;
-                break;
             case "--request-timeout" when i + 1 < a.Length &&
                 double.TryParse(
                     a[i + 1],
@@ -582,6 +655,9 @@ LoadGenOptions? ParseArgs(string[] a)
                     out var timeout) && timeout is >= 1 and <= 600:
                 requestTimeout = timeout;
                 i++;
+                break;
+            case "--saturate":
+                saturate = true;
                 break;
             default:
                 return null;
@@ -592,9 +668,6 @@ LoadGenOptions? ParseArgs(string[] a)
         parsedDuration is <= 0 ||
         (parsedDuration is { } duration && !double.IsFinite(duration)) ||
         parsedDuration > TimeSpan.MaxValue.TotalSeconds ||
-        string.IsNullOrWhiteSpace(runLabel) ||
-        runLabel.Length > 40 ||
-        runLabel.Any(char.IsControl) ||
         !Uri.TryCreate(url, UriKind.Absolute, out var baseUri) ||
         (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps)
         ? null
@@ -605,8 +678,8 @@ LoadGenOptions? ParseArgs(string[] a)
             url,
             selectedProfile,
             reportInterval,
-            runLabel,
-            requestTimeout);
+            requestTimeout,
+            saturate);
 }
 
 internal enum RequestKind
@@ -627,8 +700,16 @@ internal sealed record LoadGenOptions(
     string BaseUrl,
     string Profile,
     double ReportIntervalSeconds,
-    string RunLabel,
-    double RequestTimeoutSeconds);
+    double RequestTimeoutSeconds,
+    bool Saturate);
+
+internal sealed record DashboardRenderContext(
+    bool IsPaused,
+    TimeSpan? Duration,
+    bool ShowControls,
+    bool IsSaturating = false,
+    bool ThrottlingObserved = false,
+    bool SaturationAtMaximum = false);
 
 internal static class LoadProfiles
 {
@@ -651,6 +732,9 @@ internal static class LoadGenProfiles
 
     public static IReadOnlyList<RequestKind> GetRequestKinds(string profile) =>
         profile == LoadProfiles.Comparison ? ComparisonKinds : MixedKinds;
+
+    public static string GetDisplayName(string profile) =>
+        profile == LoadProfiles.Comparison ? "read" : profile;
 }
 
 internal static class LoadGenConstants
@@ -662,6 +746,7 @@ internal static class LoadGenConstants
     public const int BurstPeriodSeconds = 30;
     public const int BurstDurationSeconds = 5;
     public const int BurstMultiplier = 10;
+    public const int MaximumConcurrency = 4_000;
     public const string ComparisonCity = "Memphis";
     public const string ComparisonCustomerId = "customer-00001";
 }
@@ -680,12 +765,28 @@ internal sealed class MetricsCollector
         int statusCode,
         double? requestCharge,
         TimeSpan elapsed) =>
-        _metrics[(int)kind].RecordCompleted(statusCode, requestCharge, elapsed, LatencyUpperBounds);
+        RecordCompleted(kind, statusCode, requestCharge, CosmosQueryScope.Unknown, elapsed);
+
+    public void RecordCompleted(
+        RequestKind kind,
+        int statusCode,
+        double? requestCharge,
+        CosmosQueryScope queryScope,
+        TimeSpan elapsed) =>
+        _metrics[(int)kind].RecordCompleted(statusCode, requestCharge, queryScope, elapsed, LatencyUpperBounds);
 
     public void RecordNetworkFailure(RequestKind kind, TimeSpan elapsed) =>
         _metrics[(int)kind].RecordNetworkFailure(elapsed, LatencyUpperBounds);
 
     public MetricsSnapshot Snapshot() => new(_metrics.Select(metric => metric.Snapshot()).ToArray());
+
+    public void Reset()
+    {
+        foreach (var metric in _metrics)
+        {
+            metric.Reset();
+        }
+    }
 
     public static double GetPercentileMilliseconds(IReadOnlyList<long> histogram, double percentile)
     {
@@ -728,35 +829,45 @@ internal sealed class OperationMetrics(int histogramSize)
     private readonly object _sync = new();
     private readonly long[] _histogram = new long[histogramSize];
     private long _sent;
+    private long _active;
     private long _completed;
     private long _success;
+    private long _throttled;
     private long _clientErrors;
     private long _serverErrors;
     private long _networkErrors;
     private long _charged;
     private double _requestCharge;
     private double _totalMilliseconds;
+    private CosmosQueryScope _queryScope;
 
     public void RecordSent()
     {
         lock (_sync)
         {
             _sent++;
+            _active++;
         }
     }
 
     public void RecordCompleted(
         int statusCode,
         double? requestCharge,
+        CosmosQueryScope queryScope,
         TimeSpan elapsed,
         IReadOnlyList<double> latencyUpperBounds)
     {
         lock (_sync)
         {
+            _active--;
             _completed++;
             if (statusCode is >= 200 and < 300)
             {
                 _success++;
+            }
+            else if (statusCode == 429)
+            {
+                _throttled++;
             }
             else if (statusCode < 500)
             {
@@ -773,6 +884,8 @@ internal sealed class OperationMetrics(int histogramSize)
                 _requestCharge += charge;
             }
 
+            _queryScope = _queryScope.Combine(queryScope);
+
             RecordLatency(elapsed, latencyUpperBounds);
         }
     }
@@ -781,6 +894,7 @@ internal sealed class OperationMetrics(int histogramSize)
     {
         lock (_sync)
         {
+            _active--;
             _completed++;
             _networkErrors++;
             RecordLatency(elapsed, latencyUpperBounds);
@@ -793,15 +907,37 @@ internal sealed class OperationMetrics(int histogramSize)
         {
             return new OperationMetricsSnapshot(
                 _sent,
+                _active,
                 _completed,
                 _success,
+                _throttled,
                 _clientErrors,
                 _serverErrors,
                 _networkErrors,
                 _charged,
                 _requestCharge,
                 _totalMilliseconds,
+                _queryScope,
                 [.. _histogram]);
+        }
+    }
+
+    public void Reset()
+    {
+        lock (_sync)
+        {
+            _sent = _active;
+            _completed = 0;
+            _success = 0;
+            _throttled = 0;
+            _clientErrors = 0;
+            _serverErrors = 0;
+            _networkErrors = 0;
+            _charged = 0;
+            _requestCharge = 0;
+            _totalMilliseconds = 0;
+            _queryScope = CosmosQueryScope.Unknown;
+            Array.Clear(_histogram);
         }
     }
 
@@ -820,29 +956,82 @@ internal sealed class OperationMetrics(int histogramSize)
 
 internal sealed record OperationMetricsSnapshot(
     long Sent,
+    long Active,
     long Completed,
     long Success,
+    long Throttled,
     long ClientErrors,
     long ServerErrors,
     long NetworkErrors,
     long Charged,
     double RequestCharge,
     double TotalMilliseconds,
+    CosmosQueryScope QueryScope,
     long[] Histogram)
 {
     public static OperationMetricsSnapshot operator -(
         OperationMetricsSnapshot current,
         OperationMetricsSnapshot previous) => new(
             current.Sent - previous.Sent,
+            current.Active,
             current.Completed - previous.Completed,
             current.Success - previous.Success,
+            current.Throttled - previous.Throttled,
             current.ClientErrors - previous.ClientErrors,
             current.ServerErrors - previous.ServerErrors,
             current.NetworkErrors - previous.NetworkErrors,
             current.Charged - previous.Charged,
             current.RequestCharge - previous.RequestCharge,
             current.TotalMilliseconds - previous.TotalMilliseconds,
+            current.QueryScope,
             current.Histogram.Zip(previous.Histogram, (left, right) => left - right).ToArray());
+}
+
+internal enum CosmosQueryScope
+{
+    Unknown,
+    PointRead,
+    SinglePartition,
+    CrossPartition,
+    NotApplicable,
+    Mixed
+}
+
+internal static class CosmosQueryScopeExtensions
+{
+    public static CosmosQueryScope Parse(string? value) => value?.ToLowerInvariant() switch
+    {
+        "point-read" => CosmosQueryScope.PointRead,
+        "single-partition" => CosmosQueryScope.SinglePartition,
+        "cross-partition" => CosmosQueryScope.CrossPartition,
+        "not-applicable" => CosmosQueryScope.NotApplicable,
+        _ => CosmosQueryScope.Unknown
+    };
+
+    public static CosmosQueryScope Combine(this CosmosQueryScope current, CosmosQueryScope observed)
+    {
+        if (observed == CosmosQueryScope.Unknown)
+        {
+            return current;
+        }
+
+        if (current == CosmosQueryScope.Unknown)
+        {
+            return observed;
+        }
+
+        return current == observed ? current : CosmosQueryScope.Mixed;
+    }
+
+    public static string ToDisplayName(this CosmosQueryScope scope) => scope switch
+    {
+        CosmosQueryScope.PointRead => "POINT",
+        CosmosQueryScope.SinglePartition => "1PK",
+        CosmosQueryScope.CrossPartition => "XPK",
+        CosmosQueryScope.NotApplicable => "N/A",
+        CosmosQueryScope.Mixed => "MIXED",
+        _ => "?"
+    };
 }
 
 internal sealed record MetricsSnapshot(OperationMetricsSnapshot[] Operations)
@@ -851,8 +1040,10 @@ internal sealed record MetricsSnapshot(OperationMetricsSnapshot[] Operations)
 
     public MetricsTotal Total => new(
         Operations.Sum(value => value.Sent),
+        Operations.Sum(value => value.Active),
         Operations.Sum(value => value.Completed),
         Operations.Sum(value => value.Success),
+        Operations.Sum(value => value.Throttled),
         Operations.Sum(value => value.ClientErrors),
         Operations.Sum(value => value.ServerErrors),
         Operations.Sum(value => value.NetworkErrors),
@@ -866,8 +1057,10 @@ internal sealed record MetricsSnapshot(OperationMetricsSnapshot[] Operations)
 
 internal sealed record MetricsTotal(
     long Sent,
+    long Active,
     long Completed,
     long Success,
+    long Throttled,
     long ClientErrors,
     long ServerErrors,
     long NetworkErrors,
@@ -918,6 +1111,36 @@ internal sealed class LiveDashboard
         }
     }
 
+    public bool IsInteractive => _interactive && !Console.IsInputRedirected;
+
+    public bool TryReadKey(out ConsoleKeyInfo key)
+    {
+        key = default;
+        if (!IsInteractive)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!Console.KeyAvailable)
+            {
+                return false;
+            }
+
+            key = Console.ReadKey(intercept: true);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
     public void Render(IReadOnlyList<string> lines)
     {
         if (!_interactive)
@@ -940,9 +1163,9 @@ internal sealed class LiveDashboard
             }
 
             _output.Write("\u001b[2J\u001b[H");
-            foreach (var line in lines)
+            for (var index = 0; index < lines.Count; index++)
             {
-                _output.WriteLine(line);
+                _output.WriteLine(StyleLine(lines[index], index));
             }
             _output.Flush();
         }
@@ -967,6 +1190,46 @@ internal sealed class LiveDashboard
 
         _completed = true;
         RestoreTerminal();
+    }
+
+    private static string StyleLine(string line, int index)
+    {
+        const string reset = "\u001b[0m";
+        if (index == 0)
+        {
+            return $"\u001b[1;36m{line}{reset}";
+        }
+
+        if (index == 1 || line.StartsWith("operation", StringComparison.Ordinal))
+        {
+            return $"\u001b[36m{line}{reset}";
+        }
+
+        if (line.Contains("PAUSED", StringComparison.Ordinal) || HasPositiveMetricColumn(line, 4))
+        {
+            return $"\u001b[33m{line}{reset}";
+        }
+
+        if (HasPositiveMetricColumn(line, 5))
+        {
+            return $"\u001b[31m{line}{reset}";
+        }
+
+        return $"\u001b[32m{line}{reset}";
+    }
+
+    private static bool HasPositiveMetricColumn(string line, int offsetFromScope)
+    {
+        var columns = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var scopeIndex = Array.FindIndex(columns, column => column is "POINT" or "1PK" or "XPK" or "N/A" or "MIXED" or "?");
+        var metricIndex = scopeIndex + offsetFromScope;
+        return scopeIndex >= 0 && columns.Length > metricIndex &&
+            long.TryParse(
+                columns[metricIndex],
+                NumberStyles.Integer | NumberStyles.AllowThousands,
+                CultureInfo.InvariantCulture,
+                out var value) &&
+            value > 0;
     }
 
     private void RestoreTerminal()

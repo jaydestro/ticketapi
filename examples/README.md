@@ -47,14 +47,14 @@ are comparable. Start one API at a time, then identify its captured project dire
 launcher:
 
 ```powershell
-.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\before\TicketingApi -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2 -Duration 60
-.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\after\TicketingApi -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2 -Duration 60
+.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\before\TicketingApi -RunLabel "Before fix" -Workload Read -Concurrency 10 -Seed 42 -ReportInterval 0.5 -Duration 60
+.\scripts\run-loadgen.ps1 -ApiDirectory .\examples\after\TicketingApi -RunLabel "After fix" -Workload Read -Concurrency 10 -Seed 42 -ReportInterval 0.5 -Duration 60
 ```
 
-The live dashboard and final report include `run=before` or `run=after`, so saved output remains
-attributable when the two runs are compared.
+`-RunLabel` gives each example an explicit label in the live dashboard and final report, so saved
+output remains attributable without teaching LoadGen about this repository's naming convention.
 
-The comparison profile is read-only, so measuring does not modify seeded data.
+The Read workload is read-only, so measuring does not modify seeded data.
 
 ## What is not captured here
 

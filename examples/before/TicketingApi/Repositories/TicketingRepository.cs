@@ -23,12 +23,23 @@ public sealed class TicketingRepository : ITicketingRepository
         TicketEvent ticketEvent,
         CancellationToken cancellationToken)
     {
-        var response = await _events.CreateItemAsync(
-            ticketEvent,
-            new PartitionKey(ticketEvent.Id),
-            cancellationToken: cancellationToken);
+        try
+        {
+            var response = await _events.CreateItemAsync(
+                ticketEvent,
+                new PartitionKey(ticketEvent.Id),
+                cancellationToken: cancellationToken);
 
-        return new CosmosResult<TicketEvent>(response.Resource, response.RequestCharge);
+            return new CosmosResult<TicketEvent>(
+                response.Resource,
+                response.RequestCharge,
+                CosmosQueryScopes.NotApplicable);
+        }
+        catch (CosmosException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            TagQueryScope(exception, CosmosQueryScopes.NotApplicable);
+            throw;
+        }
     }
 
     public async Task<CosmosResult<TicketEvent?>> GetEventAsync(
@@ -42,12 +53,23 @@ public sealed class TicketingRepository : ITicketingRepository
                 new PartitionKey(id),
                 cancellationToken: cancellationToken);
 
-            return new CosmosResult<TicketEvent?>(response.Resource, response.RequestCharge);
+            return new CosmosResult<TicketEvent?>(
+                response.Resource,
+                response.RequestCharge,
+                CosmosQueryScopes.PointRead);
         }
         catch (CosmosException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
         {
-            return new CosmosResult<TicketEvent?>(null, exception.RequestCharge);
+            return new CosmosResult<TicketEvent?>(
+                null,
+                exception.RequestCharge,
+                CosmosQueryScopes.PointRead);
         }
+            catch (CosmosException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                TagQueryScope(exception, CosmosQueryScopes.PointRead);
+                throw;
+            }
     }
 
     public Task<CosmosResult<IReadOnlyList<TicketEvent>>> GetUpcomingEventsAsync(
@@ -75,42 +97,54 @@ public sealed class TicketingRepository : ITicketingRepository
         PurchaseTicketsRequest request,
         CancellationToken cancellationToken)
     {
-        var eventResult = await GetEventAsync(request.EventId, cancellationToken);
-        var ticketEvent = eventResult.Value;
-        if (ticketEvent is null)
+        try
         {
-            return new CosmosResult<Order?>(null, eventResult.RequestCharge);
+            var eventResult = await GetEventAsync(request.EventId, cancellationToken);
+            var ticketEvent = eventResult.Value;
+            if (ticketEvent is null)
+            {
+                return new CosmosResult<Order?>(
+                    null,
+                    eventResult.RequestCharge,
+                    CosmosQueryScopes.NotApplicable);
+            }
+
+            if (ticketEvent.AvailableSeats < request.Quantity)
+            {
+                throw new InvalidOperationException("Not enough seats are available.");
+            }
+
+            ticketEvent.AvailableSeats -= request.Quantity;
+            var eventResponse = await _events.ReplaceItemAsync(
+                ticketEvent,
+                ticketEvent.Id,
+                new PartitionKey(ticketEvent.Id),
+                cancellationToken: cancellationToken);
+
+            var order = new Order
+            {
+                EventId = ticketEvent.Id,
+                CustomerId = request.CustomerId,
+                Quantity = request.Quantity,
+                PriceTier = ticketEvent.PriceTier,
+                TotalPrice = GetUnitPrice(ticketEvent.PriceTier) * request.Quantity
+            };
+
+            var orderResponse = await _orders.CreateItemAsync(
+                order,
+                new PartitionKey(order.Id),
+                cancellationToken: cancellationToken);
+
+            return new CosmosResult<Order?>(
+                orderResponse.Resource,
+                eventResult.RequestCharge + eventResponse.RequestCharge + orderResponse.RequestCharge,
+                CosmosQueryScopes.NotApplicable);
         }
-
-        if (ticketEvent.AvailableSeats < request.Quantity)
+        catch (CosmosException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
         {
-            throw new InvalidOperationException("Not enough seats are available.");
+            TagQueryScope(exception, CosmosQueryScopes.NotApplicable);
+            throw;
         }
-
-        ticketEvent.AvailableSeats -= request.Quantity;
-        var eventResponse = await _events.ReplaceItemAsync(
-            ticketEvent,
-            ticketEvent.Id,
-            new PartitionKey(ticketEvent.Id),
-            cancellationToken: cancellationToken);
-
-        var order = new Order
-        {
-            EventId = ticketEvent.Id,
-            CustomerId = request.CustomerId,
-            Quantity = request.Quantity,
-            PriceTier = ticketEvent.PriceTier,
-            TotalPrice = GetUnitPrice(ticketEvent.PriceTier) * request.Quantity
-        };
-
-        var orderResponse = await _orders.CreateItemAsync(
-            order,
-            new PartitionKey(order.Id),
-            cancellationToken: cancellationToken);
-
-        return new CosmosResult<Order?>(
-            orderResponse.Resource,
-            eventResult.RequestCharge + eventResponse.RequestCharge + orderResponse.RequestCharge);
     }
 
     public Task<CosmosResult<IReadOnlyList<Order>>> GetOrdersByCustomerAsync(
@@ -137,21 +171,42 @@ public sealed class TicketingRepository : ITicketingRepository
     private static async Task<CosmosResult<IReadOnlyList<T>>> QueryAsync<T>(
         Container container,
         QueryDefinition query,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        QueryRequestOptions? requestOptions = null)
     {
         var results = new List<T>();
         var requestCharge = 0d;
-        using var iterator = container.GetItemQueryIterator<T>(query);
+        using var iterator = container.GetItemQueryIterator<T>(query, requestOptions: requestOptions);
 
-        while (iterator.HasMoreResults)
+        try
         {
-            var response = await iterator.ReadNextAsync(cancellationToken);
-            requestCharge += response.RequestCharge;
-            results.AddRange(response);
+            while (iterator.HasMoreResults)
+            {
+                var response = await iterator.ReadNextAsync(cancellationToken);
+                requestCharge += response.RequestCharge;
+                results.AddRange(response);
+            }
+        }
+        catch (CosmosException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            TagQueryScope(
+                exception,
+                requestOptions?.PartitionKey is null
+                    ? CosmosQueryScopes.CrossPartition
+                    : CosmosQueryScopes.SinglePartition);
+            throw;
         }
 
-        return new CosmosResult<IReadOnlyList<T>>(results, requestCharge);
+        return new CosmosResult<IReadOnlyList<T>>(
+            results,
+            requestCharge,
+            requestOptions?.PartitionKey is null
+                ? CosmosQueryScopes.CrossPartition
+                : CosmosQueryScopes.SinglePartition);
     }
+
+    private static void TagQueryScope(CosmosException exception, string queryScope) =>
+        exception.Data[CosmosQueryScopes.ExceptionDataKey] = queryScope;
 
     private static decimal GetUnitPrice(string priceTier) => priceTier.ToLowerInvariant() switch
     {

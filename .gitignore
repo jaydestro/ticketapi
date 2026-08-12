@@ -1,5 +1,27 @@
+# Dependencies
+**/node_modules/
+
+# Build output
 bin/
 obj/
+artifacts/
+dist/
+out/
+.next/
+
+# Test and coverage output
+TestResults/
+coverage/
+.nyc_output/
+*.coverage
+*.coveragexml
+
+# Local IDE files
+.vs/
+*.suo
+*.user
+
+# Local configuration and generated workspace state
 appsettings.json
 .azure/
 infra/
@@ -7,4 +29,4 @@ infra/
 .claude/
 skills-lock.json
 examples/*/appsettings.json
-TestResults/
+/logs/

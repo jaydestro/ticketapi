@@ -76,13 +76,13 @@ document, and inside the prompt text that gets copied.
 ## Measuring a change
 
 If a change is meant to affect Cosmos DB cost or latency, include a LoadGen comparison. Keep
-the profile, seed, concurrency, and report interval identical between the two runs:
+the workload, seed, concurrency, and report interval identical between the two runs:
 
 ```powershell
-.\scripts\run-loadgen.ps1 -Workload Comparison -Concurrency 10 -Seed 42 -ReportInterval 2
+.\scripts\run-loadgen.ps1 -Workload Read -Concurrency 10 -Seed 42 -ReportInterval 0.5
 ```
 
-The default comparison profile is read-only, so it will not modify seeded data.
+The default Read workload is read-only, so it will not modify seeded data.
 
 ## Reporting problems
 

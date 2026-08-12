@@ -25,7 +25,7 @@ public sealed class EventsController(ITicketingRepository repository) : Controll
         };
 
         var result = await repository.CreateEventAsync(ticketEvent, cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return CreatedAtAction(nameof(GetById), new { id = result.Value.Id }, result.Value);
     }
 
@@ -33,7 +33,7 @@ public sealed class EventsController(ITicketingRepository repository) : Controll
     public async Task<ActionResult<TicketEvent>> GetById(string id, CancellationToken cancellationToken)
     {
         var result = await repository.GetEventAsync(id, cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return result.Value is null ? NotFound() : Ok(result.Value);
     }
 
@@ -41,7 +41,7 @@ public sealed class EventsController(ITicketingRepository repository) : Controll
     public async Task<ActionResult<IReadOnlyList<TicketEvent>>> GetUpcoming(CancellationToken cancellationToken)
     {
         var result = await repository.GetUpcomingEventsAsync(cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return Ok(result.Value);
     }
 
@@ -51,11 +51,14 @@ public sealed class EventsController(ITicketingRepository repository) : Controll
         CancellationToken cancellationToken)
     {
         var result = await repository.GetEventsByCityAsync(city, cancellationToken);
-        AddRequestCharge(result.RequestCharge);
+        AddCosmosMetadata(result.RequestCharge, result.QueryScope);
         return Ok(result.Value);
     }
 
-    private void AddRequestCharge(double requestCharge) =>
+    private void AddCosmosMetadata(double requestCharge, string queryScope)
+    {
         Response.Headers["x-ms-request-charge"] = requestCharge.ToString(
             System.Globalization.CultureInfo.InvariantCulture);
+        Response.Headers["x-cosmos-query-scope"] = queryScope;
+    }
 }
