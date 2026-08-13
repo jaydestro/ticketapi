@@ -9,6 +9,57 @@ The prompts describe what to build, not how to build it. That deliberate latitud
 repository a before-and-after harness: run the same prompts with and without Cosmos DB design
 guidance, then use LoadGen to measure the difference in request units and latency.
 
+## Tools used
+
+- [Cosmos DB Agent Kit](https://aka.ms/azurecosmosdb-agent-kit) provides tools and guidance
+	for building AI-assisted workflows with Azure Cosmos DB.
+- [Azure Cosmos DB Shell](https://github.com/Azure/CosmosDBShell) is a command-line interface
+	for interacting with Azure Cosmos DB through intuitive, Bash-like commands, with optional
+	Model Context Protocol (MCP) server support for AI-powered automation.
+
+## Architecture
+
+The diagram shows the completed, optimized implementation under `examples/after`. The
+`examples/before` project preserves the `/id`-partitioned events and orders baseline used for
+LoadGen comparisons.
+
+```mermaid
+flowchart LR
+	Developer[Developer] --> Prompts[Numbered build and review prompts]
+	AgentKit[Cosmos DB Agent Kit] -. design guidance .-> Prompts
+	Prompts --> Azure[Azure resource provisioning]
+	Azure --> Entra[Microsoft Entra ID and managed identity]
+	Azure --> Cosmos
+	Shell[Azure Cosmos DB Shell] -. inspect and operate .-> Cosmos
+
+	Seeder[Seeder] -->|bulk upserts| Write
+	LoadGen[LoadGen] -->|HTTP and OpenAPI discovery| Api
+
+	subgraph Api[ASP.NET Core Ticketing API]
+		Controllers[Events and orders controllers] --> Repository[Ticketing repository]
+		ChangeFeed[Change-feed hosted worker]
+	end
+
+	Api -->|DefaultAzureCredential| Entra
+	Seeder -->|DefaultAzureCredential| Entra
+
+	subgraph Cosmos[Azure Cosmos DB for NoSQL]
+		Write[(ticketing-write<br/>partition key: /eventId)]
+		EventsByCity[(events-by-city<br/>partition key: /cityKey)]
+		OrdersByCustomer[(orders-by-customer<br/>partition key: /customerId)]
+		Leases[(change-feed-leases<br/>partition key: /id)]
+	end
+
+	Entra -->|RBAC access tokens| Cosmos
+	Repository -->|events and event orders| Write
+	Repository -->|events by city| EventsByCity
+	Repository -->|orders by customer| OrdersByCustomer
+	Write -->|change feed| ChangeFeed
+	ChangeFeed -->|event projections| EventsByCity
+	ChangeFeed -->|order projections| OrdersByCustomer
+	ChangeFeed --- Leases
+```
+
 ## Build sequence
 
 Run the numbered prompts in order.
