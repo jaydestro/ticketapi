@@ -142,7 +142,8 @@ deterministic workload:
 - Post-run validation of counts, skew, RU consumption, and elapsed time
 
 Deterministic IDs and upserts make the seed operation repeatable without increasing document
-counts.
+counts. Use [Docs/seeder.md](Docs/seeder.md) for configuration, target modes, reset behavior,
+expected write counts, and progress output.
 
 ### 03 - Build the API
 
@@ -208,7 +209,8 @@ the repaired API works as expected and quantifies the scaling improvement.
 ### Seeder
 
 `Seeder` generates reproducible event and order documents with a controlled traffic skew. It
-also reports total request units and elapsed time for the bulk operation.
+also reports total request units and elapsed time for the bulk operation. See
+[Docs/seeder.md](Docs/seeder.md) for complete usage and safety guidance.
 
 ### LoadGen
 
