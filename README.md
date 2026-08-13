@@ -163,15 +163,19 @@ terminal:
 dotnet run --project .\TicketingApi\TicketingApi.csproj --launch-profile http
 ```
 
-From the repository root in a second PowerShell terminal, run a bounded read-only baseline:
+From the repository root in a second PowerShell terminal, start the interactive LoadGen launcher
+and follow its prompts to capture a baseline:
 
 ```powershell
-.\scripts\run-loadgen.ps1 -ApiDirectory .\TicketingApi -Workload Read -Concurrency 10 -Seed 42 -ReportInterval 0.5 -Duration 60
+.\scripts\run-loadgen.ps1
 ```
+
+You can instead supply your own LoadGen command-line parameters. Record the settings you choose so
+you can repeat them after prompt 04.
 
 The launcher writes the completed summary to a timestamped `.log` file under
 `logs/loadgen` at the repository root and prints its absolute path as
-`loadgen: summary log: <path>`. Keep this log and the command settings for the comparison after
+`loadgen: summary log: <path>`. Keep this log and your settings for the comparison after
 prompt 04. See [Docs/loadgen.md](Docs/loadgen.md) for dashboard metrics, controls, and additional
 options.
 
@@ -194,11 +198,11 @@ finish before continuing:
 4. SDK use and maintainability
 
 A final repair prompt applies Cosmos DB best practices to the API code. Once all fixes are made,
-rebuild and restart the API, then run the exact bounded LoadGen command from prompt 03 again.
-Confirm that all five Read operations complete successfully without unexpected errors, and compare
-the new summary log with the baseline for request units, query scope, throttling, and p95 latency.
-The matching post-fix run verifies that the repaired API works as expected and quantifies the
-scaling improvement.
+rebuild and restart the API. Run the interactive LoadGen launcher again, or use your own command
+line, with the same settings as the baseline. Confirm that all selected operations complete
+successfully without unexpected errors, and compare the new summary log with the baseline for
+request units, query scope, throttling, and p95 latency. The matching post-fix run verifies that
+the repaired API works as expected and quantifies the scaling improvement.
 
 ## Supporting projects
 
