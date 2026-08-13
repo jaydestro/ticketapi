@@ -1,13 +1,16 @@
 # Ticketing API Demo
 
-This repository builds a live event ticketing API on Azure Cosmos DB through a sequence of
-prompts. The finished system demonstrates keyless Azure authentication, repeatable
-infrastructure, deterministic test data, a .NET REST API, workload generation, and iterative
-Cosmos DB design reviews.
+This repository accompanies the Azure Cosmos DB video
+[Let the Agent Write It—But Can It Scale?](https://www.youtube.com/live/RhS3ICyn3pc). It tests a
+practical question: an AI agent can quickly generate a working application, but will its data
+model, queries, and SDK usage still perform under a realistic workload?
 
-The prompts describe what to build, not how to build it. That deliberate latitude makes the
-repository a before-and-after harness: run the same prompts with and without Cosmos DB design
-guidance, then use LoadGen to measure the difference in request units and latency.
+The prompts deliberately describe what to build, not how to build it. First, the agent creates a
+ticketing API without specialized Cosmos DB guidance, deterministic data is loaded, and LoadGen
+captures a baseline. The Azure Cosmos DB Agent Kit is then installed to find and repair scaling
+issues in the existing API. Running the same workload again makes the effect visible in request
+units, query scope, throttling, and latency instead of relying on code review alone. The finished
+system also demonstrates keyless Azure authentication and repeatable infrastructure.
 
 ## Tools used
 
@@ -28,7 +31,6 @@ Install and configure these tools before starting prompt 01:
   ```
 
 - **Visual Studio Code** with **GitHub Copilot Chat** and access to an agent-capable Copilot model.
-- The [**Cosmos DB Agent Kit**](https://aka.ms/azurecosmosdb-agent-kit) for the guided review.
 - **.NET SDK 10.0.302 or later**. The API, Seeder, LoadGen, and tests target `net10.0`.
 - **PowerShell 7** (`pwsh`). The included launcher and validation commands use PowerShell.
 - **Azure CLI** with the **Bicep CLI** available through `az bicep`. Sign in interactively with
@@ -154,10 +156,28 @@ the provisioned and seeded Cosmos DB data. It adds:
 - API-local models, repositories, controllers, and OpenAPI
 - Keyless access through `DefaultAzureCredential`
 
+Before installing the Azure Cosmos DB Agent Kit, start the generated API in one PowerShell
+terminal:
+
+```powershell
+dotnet run --project .\TicketingApi\TicketingApi.csproj --launch-profile http
+```
+
+From the repository root in a second PowerShell terminal, run a bounded read-only baseline:
+
+```powershell
+.\scripts\run-loadgen.ps1 -ApiDirectory .\TicketingApi -Workload Read -Concurrency 10 -Seed 42 -ReportInterval 0.5 -Duration 60
+```
+
+The launcher writes the completed summary to a timestamped `.log` file under
+`logs/loadgen` at the repository root and prints its absolute path as
+`loadgen: summary log: <path>`. Keep this log and the command settings for the comparison after
+prompt 04. See [Docs/loadgen.md](Docs/loadgen.md) for dashboard metrics, controls, and additional
+options.
+
 ### 04 - Review through four lenses
 
-Capture a baseline LoadGen run against the API created in prompt 03. Then install the Azure
-Cosmos DB Agent Kit:
+After retaining the prompt 03 baseline, install the Azure Cosmos DB Agent Kit:
 
 ```powershell
 npx skills add AzureCosmosDB/cosmosdb-agent-kit
@@ -173,8 +193,12 @@ finish before continuing:
 3. Indexing policy
 4. SDK use and maintainability
 
-A final repair prompt applies Cosmos DB best practices to the API code. Repeat the baseline
-LoadGen settings after the repairs to quantify the result.
+A final repair prompt applies Cosmos DB best practices to the API code. Once all fixes are made,
+rebuild and restart the API, then run the exact bounded LoadGen command from prompt 03 again.
+Confirm that all five Read operations complete successfully without unexpected errors, and compare
+the new summary log with the baseline for request units, query scope, throttling, and p95 latency.
+The matching post-fix run verifies that the repaired API works as expected and quantifies the
+scaling improvement.
 
 ## Supporting projects
 
