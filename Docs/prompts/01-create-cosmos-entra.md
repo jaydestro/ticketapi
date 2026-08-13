@@ -44,7 +44,14 @@ Collect these values:
    than constructing it. Allow for normal RBAC propagation, then confirm the current
    `az login` user can perform a read-only data-plane operation against both containers.
 
-5. Create the repository-root `appsettings.json` from `appsettings.json.example`. Keep the
+5. Ensure the repository-root `appsettings.json.example` exists. If it is missing, create it
+   with empty `Authentication.Authority` and `Authentication.Audience` values and a `CosmosDb`
+   section containing empty `ConnectionString`, `AccountEndpoint`, `ManagedIdentityClientId`,
+   `DatabaseName`, `EventsContainerName`, and `OrdersContainerName` values. Include explanatory
+   fields that distinguish Microsoft Entra ID authentication from emulator or key-based access.
+   Do not put deployed values, credentials, account keys, or connection strings in the example.
+
+   Create the repository-root `appsettings.json` from `appsettings.json.example`. Keep the
    example file unchanged, then set these values in the generated file:
    - `AccountEndpoint`
    - `ManagedIdentityClientId`
