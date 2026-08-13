@@ -21,7 +21,12 @@ guidance, then use LoadGen to measure the difference in request units and latenc
 
 Install and configure these tools before starting prompt 01:
 
-- **Git** to clone the repository.
+- **Git** to clone the repository:
+
+  ```powershell
+  git clone https://github.com/jaydestro/ticketapi.git
+  ```
+
 - **Visual Studio Code** with **GitHub Copilot Chat** and access to an agent-capable Copilot model.
 - The [**Cosmos DB Agent Kit**](https://aka.ms/azurecosmosdb-agent-kit) for the guided review.
 - **.NET SDK 10.0.302 or later**. The API, Seeder, LoadGen, and tests target `net10.0`.
