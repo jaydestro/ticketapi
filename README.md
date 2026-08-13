@@ -156,16 +156,25 @@ the provisioned and seeded Cosmos DB data. It adds:
 
 ### 04 - Review through four lenses
 
-[04-four-lens-prompts.md](Docs/prompts/04-four-lens-prompts.md) examines the API from four
-angles, then repairs it. Run each prompt on its own and let its fixes finish first:
+Capture a baseline LoadGen run against the API created in prompt 03. Then install the Azure
+Cosmos DB Agent Kit:
+
+```powershell
+npx skills add AzureCosmosDB/cosmosdb-agent-kit
+```
+
+Start a fresh Copilot agent session so the newly installed guidance is available.
+[04-four-lens-prompts.md](Docs/prompts/04-four-lens-prompts.md) then reviews the existing API,
+finds issues through four lenses, and repairs them. Run each prompt on its own and let its fixes
+finish before continuing:
 
 1. Data model and partition key
 2. RU efficiency
 3. Indexing policy
 4. SDK use and maintainability
 
-A final repair prompt applies Cosmos DB best practices to the API code. Capture a LoadGen
-comparison run before and after this pass to quantify the result.
+A final repair prompt applies Cosmos DB best practices to the API code. Repeat the baseline
+LoadGen settings after the repairs to quantify the result.
 
 ## Supporting projects
 
