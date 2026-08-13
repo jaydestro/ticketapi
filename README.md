@@ -156,8 +156,7 @@ the provisioned and seeded Cosmos DB data. It adds:
 - API-local models, repositories, controllers, and OpenAPI
 - Keyless access through `DefaultAzureCredential`
 
-Before installing the Azure Cosmos DB Agent Kit, start the generated API in one PowerShell
-terminal:
+Start the generated API in one PowerShell terminal:
 
 ```powershell
 dotnet run --project .\TicketingApi\TicketingApi.csproj --launch-profile http
